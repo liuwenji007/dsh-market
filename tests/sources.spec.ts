@@ -5,8 +5,9 @@
 
 import { describe, expect, it } from 'vitest'
 import {
+  githubRefOfTarget,
   findCatalogEntryForLocal, findInstalledAlias, gitAllowBuildsKey, githubRemoteIdentities, githubRepoIdentities, githubRepoIdentity, githubTargetAtCommit,
-  installTargetFor, isLocalSpec, parseGitHubRemote, parseGitHubRepository, parseSourceUrl, repoOf, restoreBlockedByWorkspace, restoreTargetForLocal, workspaceProtocolDeps,
+  installTargetFor, isLocalSpec, lookupRepoFromUrl, parseGitHubRemote, parseGitHubRepository, parseSourceUrl, repoOf, resolveCatalogRestore, restoreBlockedByWorkspace, restoreTargetForLocal, workspaceProtocolDeps,
 } from '../src/sources.ts'
 
 describe('parseSourceUrl', () => {
@@ -134,6 +135,31 @@ describe('gitAllowBuildsKey (#68/#69)', () => {
   })
 })
 
+describe('githubRefOfTarget (#446)', () => {
+  it('reads the branch or tag an install actually names', () => {
+    expect(githubRefOfTarget('github:o/r#publish')).toBe('publish')
+    expect(githubRefOfTarget('github:o/r#v2.1.0')).toBe('v2.1.0')
+    // pnpm allows a ref and a subpath in one fragment.
+    expect(githubRefOfTarget('github:o/r#publish&path:/packages/p')).toBe('publish')
+    expect(githubRefOfTarget('github:o/r#path:/packages/p&publish')).toBe('publish')
+  })
+
+  it('answers null where the default branch is the right question', () => {
+    expect(githubRefOfTarget('github:o/r')).toBeNull()
+    expect(githubRefOfTarget('github:o/r#path:/packages/p')).toBeNull()
+    // A pin: "is there something newer" means the default branch, and
+    // resolving the pin as a ref would compare a commit against itself.
+    expect(githubRefOfTarget(`github:o/r#${'a'.repeat(40)}`)).toBeNull()
+    // A semver range selects a release line the ref advertisement cannot
+    // answer; treating it as a branch name would look up a ref that is not
+    // there and report no update at all.
+    expect(githubRefOfTarget('github:o/r#semver:^1.2.0')).toBeNull()
+    // Not a github spec.
+    expect(githubRefOfTarget('dsh-loop@1.0.0')).toBeNull()
+    expect(githubRefOfTarget('https://example.test/x.tgz')).toBeNull()
+  })
+})
+
 describe('findCatalogEntryForLocal', () => {
   const plugins = [
     { name: 'dsh-loop', npm: 'dsh-loop', url: 'https://github.com/o/dsh-loop' },
@@ -179,6 +205,45 @@ describe('findCatalogEntryForLocal', () => {
       { name: 'mono-cli', npm: null, url: 'https://github.com/m/mono' },
     ]
     expect(findCatalogEntryForLocal(mono, 'mono-cli', ['m/mono'])?.name).toBe('mono-cli')
+  })
+
+  it('does not restore a unique same-named catalog entry when repo evidence disagrees', () => {
+    const plugins = [
+      { name: 'dsh-humanizer', npm: 'dsh-humanizer', url: 'https://github.com/lynote-ai/dsh-humanizer' },
+    ]
+    expect(findCatalogEntryForLocal(plugins, 'dsh-humanizer', ['handsomeliu/dsh-humanizer'])).toBeNull()
+    expect(findCatalogEntryForLocal(plugins, 'dsh-humanizer', [], ['handsomeliu/dsh-humanizer'])).toBeNull()
+    expect(findCatalogEntryForLocal(plugins, 'dsh-humanizer', ['lynote-ai/dsh-humanizer'])?.url)
+      .toBe('https://github.com/lynote-ai/dsh-humanizer')
+  })
+
+  it('resolveCatalogRestore distinguishes missing catalog rows from repo mismatch', () => {
+    const plugins = [
+      { name: 'dsh-humanizer', npm: 'dsh-humanizer', url: 'https://github.com/lynote-ai/dsh-humanizer' },
+    ]
+    expect(resolveCatalogRestore(plugins, 'missing-plug')).toEqual({ ok: false, reason: 'no-catalog' })
+    expect(resolveCatalogRestore(plugins, 'dsh-humanizer', ['handsomeliu/dsh-humanizer']))
+      .toEqual({ ok: false, reason: 'repo-mismatch' })
+    expect(resolveCatalogRestore(plugins, 'dsh-humanizer', ['lynote-ai/dsh-humanizer']))
+      .toEqual({ ok: true, entry: plugins[0], verified: true })
+  })
+
+  it('marks a name-only match as unverified rather than presenting it as the source (#485)', () => {
+    // A local checkout that declares no repository gives the market nothing
+    // to match on, so a unique same-named catalog entry is a guess. Usually
+    // a good one — the local copy is a tweaked copy of that entry — but
+    // @liuwenji007's fork restored to a different author's plugin that
+    // happened to share the name, which is someone else's code arriving
+    // under a button labelled "restore". The match is kept; the caller is
+    // told not to present it as a certainty.
+    const plugins = [
+      { name: 'dsh-humanizer', npm: 'dsh-humanizer', url: 'https://github.com/lynote-ai/dsh-humanizer' },
+    ]
+    expect(resolveCatalogRestore(plugins, 'dsh-humanizer'))
+      .toEqual({ ok: true, entry: plugins[0], verified: false })
+    // A hint is evidence: the entry agreed with something other than a name.
+    expect(resolveCatalogRestore(plugins, 'dsh-humanizer', [], ['lynote-ai/dsh-humanizer']))
+      .toEqual({ ok: true, entry: plugins[0], verified: true })
   })
 })
 
@@ -261,5 +326,23 @@ describe('githubTargetAtCommit', () => {
   it('refuses non-github targets and invalid commits', () => {
     expect(githubTargetAtCommit('dsh-loop', sha)).toBeNull()
     expect(githubTargetAtCommit('github:o/r', 'short')).toBeNull()
+  })
+})
+
+describe('lookupRepoFromUrl (display/lookup only — NOT for install/rollback)', () => {
+  it('extracts repo from catalog Release asset URLs', () => {
+    expect(lookupRepoFromUrl('https://github.com/owner/repo/releases/latest/download/plugin-1.0.0.tgz'))
+      .toBe('https://github.com/owner/repo')
+    expect(lookupRepoFromUrl('https://github.com/owner/repo/releases/download/v1.0.0/plugin-1.0.0.tgz'))
+      .toBe('https://github.com/owner/repo')
+    expect(lookupRepoFromUrl('https://github.com/owner/repo/releases/download/v1.0.0/plugin-1.0.0.tar.gz'))
+      .toBe('https://github.com/owner/repo')
+  })
+
+  it('returns null for non-Release-asset URLs', () => {
+    expect(lookupRepoFromUrl('https://github.com/owner/repo/archive/refs/heads/main.tar.gz')).toBeNull()
+    expect(lookupRepoFromUrl('https://codeload.github.com/owner/repo/tar.gz/' + 'a'.repeat(40))).toBeNull()
+    expect(lookupRepoFromUrl('dsh-loop')).toBeNull()
+    expect(lookupRepoFromUrl('@scope/pkg')).toBeNull()
   })
 })

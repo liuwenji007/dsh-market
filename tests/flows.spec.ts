@@ -356,24 +356,46 @@ const hot = vi.hoisted(() => ({
   groupOrder: [] as string[],
   /** Stands in for the channel line of state.json; undefined = never chosen. */
   channel: undefined as 'stable' | 'beta' | 'dev' | undefined,
+  region: undefined as 'global' | 'china' | undefined,
+  regionAuto: undefined as true | undefined,
+  githubProxy: undefined as string | undefined,
+  notes: {} as Record<string, string>,
+  favorites: [] as string[],
   failNext: false,
 }))
 vi.mock('../src/hot.ts', () => ({
+  MAX_NOTE: 200,
+  MAX_FAVORITES: 500,
   cleanHotDir: () => {},
   readDisabledThemes: () => hot.disabled,
   writeDisabledThemes: (_dir: string, set: Set<string>) => { hot.disabled = new Set(set) },
   readDisabled: () => hot.disabled,
   writeDisabled: (_dir: string, set: Set<string>) => { hot.disabled = new Set(set) },
-  readMarketState: () => ({ disabled: hot.disabled, groups: hot.groups, groupOrder: hot.groupOrder, channel: hot.channel }),
+  readMarketState: () => ({
+    disabled: hot.disabled, groups: hot.groups, groupOrder: hot.groupOrder,
+    channel: hot.channel, region: hot.region, regionAuto: hot.regionAuto,
+    githubProxy: hot.githubProxy,
+    notes: hot.notes, favorites: hot.favorites,
+  }),
   // Carries `channel` because the real one does. A stand-in that silently
   // drops a field cannot fail when the code under test forgets to persist
   // it — which is exactly how the channel choice reached this suite with
   // zero coverage while four route tests passed.
-  writeMarketState: (_dir: string, state: { disabled: Set<string>; groups: Record<string, string[]>; groupOrder: string[]; channel?: 'stable' | 'beta' | 'dev' }) => {
+  writeMarketState: (_dir: string, state: {
+    disabled: Set<string>; groups: Record<string, string[]>; groupOrder: string[]
+    channel?: 'stable' | 'beta' | 'dev'; region?: 'global' | 'china'; regionAuto?: true
+    githubProxy?: string
+    notes?: Record<string, string>; favorites?: string[]
+  }) => {
     hot.disabled = new Set(state.disabled)
     hot.groups = state.groups
     hot.groupOrder = state.groupOrder
     hot.channel = state.channel
+    if (Object.prototype.hasOwnProperty.call(state, 'region')) hot.region = state.region
+    if (Object.prototype.hasOwnProperty.call(state, 'regionAuto')) hot.regionAuto = state.regionAuto
+    if (Object.prototype.hasOwnProperty.call(state, 'githubProxy')) hot.githubProxy = state.githubProxy
+    if (state.notes !== undefined) hot.notes = state.notes
+    if (state.favorites !== undefined) hot.favorites = state.favorites
   },
   listHotMounts: () => [...hot.mounts],
   hotMount: (_ctx: unknown, _dir: string, name: string) => {
@@ -394,10 +416,13 @@ vi.mock('../src/hot.ts', () => ({
 
 // ---------------------------------------------------------------- fake restart scheduler
 const restartCalls = vi.hoisted(() => ({ count: 0 }))
+const debuggerLatch = vi.hoisted(() => ({ value: undefined as 'inspector' | null | undefined }))
 vi.mock('../src/restart.ts', async (importOriginal) => {
   const original = await importOriginal<typeof import('../src/restart.ts')>()
   return {
     ...original,
+    detectedDebugger: (...args: Parameters<typeof original.detectedDebugger>) =>
+      debuggerLatch.value !== undefined ? debuggerLatch.value : original.detectedDebugger(...args),
     // The real one SIGTERMs the process — fatal inside a test worker.
     scheduleRestart: () => {
       restartCalls.count += 1
@@ -412,6 +437,7 @@ const REGISTRY = {
   categories: { tool: { en: 'Tools' }, theme: { en: 'Themes' } },
   plugins: [
     { name: 'dsh-loop', owner: 'o', url: 'https://github.com/o/dsh-loop', category: 'tool', npm: 'dsh-loop', description: {}, install: '', added: '' },
+    { name: 'dsh-genui', owner: 'omdsh-dev', url: 'https://github.com/omdsh-dev/dsh-genui', category: 'tool', npm: '@changfenhuang/dsh-genui', description: {}, install: '', added: '' },
     // The market's own entry: the release-channel specs need it installed,
     // because the channel applies to this package and no other.
     { name: 'dshmarket', owner: 'o', url: 'https://github.com/o/dshmarket', category: 'tool', npm: 'dshmarket', description: {}, install: '', added: '' },
@@ -444,6 +470,22 @@ vi.mock('../src/registry.ts', async (importOriginal) => ({
   ...registryModule,
 }))
 registryModule.loadRegistry.mockImplementation(() => Promise.resolve(REGISTRY))
+
+// Most flow tests pin a region. These two hold the boot probe open so its
+// completion can be ordered deterministically against a manual choice or
+// route disposal.
+const regionProbe = vi.hoisted(() => ({
+  pending: null as Promise<{ region: 'global' | 'china'; probed: boolean }> | null,
+}))
+vi.mock('../src/region-probe.ts', async (importOriginal) => {
+  const original = await importOriginal<typeof import('../src/region-probe.ts')>()
+  return {
+    ...original,
+    resolveRegion: (configured?: 'global' | 'china') => configured === undefined && regionProbe.pending !== null
+      ? regionProbe.pending
+      : original.resolveRegion(configured),
+  }
+})
 
 // ---------------------------------------------------------------- testbed
 import { marketVersion, mountMarketRoutes } from '../src/routes.ts'
@@ -519,6 +561,7 @@ let bed: Testbed
 beforeEach(() => {
   home = mkdtempSync(join(tmpdir(), 'dshm-flow-'))
   process.env.DSH_HOME = home
+  delete process.env.DSHM_GITHUB_PROXY
   const dir = join(home, 'profiles', 'web')
   mkdirSync(dir, { recursive: true })
   writeFileSync(join(dir, 'package.json'), '{"dependencies":{}}')
@@ -546,11 +589,18 @@ beforeEach(() => {
   fake.running = false
   fake.calls = []
   restartCalls.count = 0
+  debuggerLatch.value = undefined
   hot.mounts = []
   hot.disabled = new Set()
   hot.groups = {}
   hot.groupOrder = []
   hot.channel = undefined
+  hot.region = undefined
+  hot.regionAuto = undefined
+  hot.githubProxy = undefined
+  hot.notes = {}
+  hot.favorites = []
+  regionProbe.pending = null
   hot.failNext = false
   bed = createTestbed()
 })
@@ -558,6 +608,7 @@ afterEach(() => {
   bed.dispose()
   vi.unstubAllGlobals()
   delete process.env.DSH_HOME
+  delete process.env.DSHM_GITHUB_PROXY
   rmSync(home, { recursive: true, force: true })
 })
 
@@ -1194,6 +1245,33 @@ describe('update flow — no npm publishing required', () => {
     expect(r.json.activation['dsh-loop']).toMatchObject({ state: 'restart', hot: false })
   })
 
+  it('keeps saying "restart to apply" on every later listing, not only in the reply', async () => {
+    // The reply is read once; the listing is read on every page load. It
+    // recomputed activation from the loader's inventory alone — which still
+    // lists the name, because the process never unloaded the module — so a
+    // refresh turned the notice back into "live" and the update looked
+    // finished while the old build was still answering. Measured against a
+    // real host in tests/web/update.e2e.ts.
+    advanceNpmLatest('1.2.0')
+    await bed.dispatch('POST', '/dsh-market/update', { name: 'dsh-loop' })
+
+    const listed = await bed.dispatch('GET', '/dsh-market/installed')
+    expect(listed.json.activation['dsh-loop']).toMatchObject({ state: 'restart', hot: false })
+  })
+
+  it('drops the restart notice once the plugin is genuinely remounted', async () => {
+    // Off and on again imports the module as it is on disk now, so this
+    // process really is serving the new build — the one way out of the
+    // notice that is not a restart, and it has to be honoured.
+    advanceNpmLatest('1.2.0')
+    await bed.dispatch('POST', '/dsh-market/update', { name: 'dsh-loop' })
+    await bed.dispatch('POST', '/dsh-market/toggle', { name: 'dsh-loop', enabled: false })
+    await bed.dispatch('POST', '/dsh-market/toggle', { name: 'dsh-loop', enabled: true })
+
+    const listed = await bed.dispatch('GET', '/dsh-market/installed')
+    expect(listed.json.activation['dsh-loop']?.state).toBe('live')
+  })
+
   it('refuses an update before mutation when package.json cannot be captured exactly', async () => {
     const manifestPath = join(fake.profileDir, 'package.json')
     const malformed = JSON.stringify({
@@ -1255,6 +1333,188 @@ describe('update flow — no npm publishing required', () => {
     const installed = JSON.parse(readFileSync(join(fake.profileDir, 'node_modules', 'dsh-loop', 'package.json'), 'utf8')) as { version?: string }
     expect(installed.version).toBe('1.0.0')
     expect(fake.calls.some(call => call.includes('dsh-loop@1.0.0'))).toBe(true)
+  })
+
+  it('pins the npm update target to the resolved version so Desktop cannot re-fetch latest (#496)', async () => {
+    advanceNpmLatest('1.2.0')
+    const r = await bed.dispatch('POST', '/dsh-market/update', { name: 'dsh-loop' })
+    expect(r.json).toMatchObject({ ok: true })
+    // One registry resolution, one install target: Desktop's install boundary
+    // must not get `@latest` and fetch again (that drift was the false
+    // RESOLVED_VERSION_MISMATCH rollback).
+    const add = fake.calls.find(call => call[0] === 'add' && call.some(arg => arg.startsWith('dsh-loop@')))
+    expect(add).toContain('dsh-loop@1.2.0')
+    expect(add?.some(arg => arg === 'dsh-loop@latest')).toBe(false)
+  })
+
+  it('keeps an exact route pin authoritative over a mismatched Desktop resolvedNpmVersion (#496)', async () => {
+    // The route already sent name@1.2.0. A host that reports a different
+    // resolvedNpmVersion (and whose pnpm tree somehow landed there) must
+    // still fail verification — otherwise the boundary field could lower
+    // the bar the route just fixed in place.
+    advanceNpmLatest('1.2.0')
+    fake.npm['dsh-loop'].versions['1.1.0'] = { manifest: { dsh: {}, main: 'lib/index.js' }, artifacts: ['lib/index.js'] }
+    bed.dispose()
+    bed = createTestbed({}, {
+      runPlugin: async (profile, args) => {
+        const target = args.filter(arg => !arg.startsWith('-')).at(-1) ?? ''
+        if (args[0] === 'add' && target.startsWith('dsh-loop@')) {
+          fake.resolvedNpmVersionOnce = '1.1.0'
+          const result = await runDshPlugin(profile, args) as {
+            exitCode: number | null
+            timedOut: boolean
+            stdout: string
+            stderr: string
+            cancelled: boolean
+          }
+          return { ...result, resolvedNpmVersion: '1.1.0' }
+        }
+        return await runDshPlugin(profile, args) as {
+          exitCode: number | null
+          timedOut: boolean
+          stdout: string
+          stderr: string
+          cancelled: boolean
+        }
+      },
+      probePnpm: () => Promise.resolve(true),
+      provisionPnpm: () => Promise.resolve({ ok: true }),
+      cancelActive: () => false,
+    })
+
+    const r = await bed.dispatch('POST', '/dsh-market/update', { name: 'dsh-loop' })
+
+    expect(r.status).toBe(502)
+    expect(r.json).toMatchObject({ ok: false, failureCode: 'RESOLVED_VERSION_MISMATCH' })
+    expect(String(r.json.error)).toMatch(/目标为 v1\.2\.0|targeted v1\.2\.0/)
+    expect(installedSpec('dsh-loop')).toBe('^1.0.0')
+  })
+
+  it('adopts the Desktop boundary pin only when the route sent a floating dist-tag (#496)', async () => {
+    // Registry metadata unavailable → add stays `name@latest`. Verification
+    // then has to trust the exact pin Desktop's boundary actually sent.
+    fake.npm['dsh-loop'].latest = '1.2.0'
+    fake.npm['dsh-loop'].versions['1.2.0'] = { manifest: { dsh: {}, main: 'lib/index.js' }, artifacts: ['lib/index.js'] }
+    vi.stubGlobal('fetch', () => Promise.reject(new Error('registry offline')))
+    bed.dispose()
+    bed = createTestbed({}, {
+      runPlugin: async (profile, args) => {
+        const target = args.filter(arg => !arg.startsWith('-')).at(-1) ?? ''
+        if (args[0] === 'add' && target === 'dsh-loop@latest') {
+          const result = await runDshPlugin(profile, args) as {
+            exitCode: number | null
+            timedOut: boolean
+            stdout: string
+            stderr: string
+            cancelled: boolean
+          }
+          return { ...result, resolvedNpmVersion: '1.2.0' }
+        }
+        if (args[0] === 'add' && target.startsWith('dsh-loop@')) {
+          // Wrong pin reported while a floating tag was NOT what we sent —
+          // should not reach here for this scenario.
+          const result = await runDshPlugin(profile, args) as {
+            exitCode: number | null
+            timedOut: boolean
+            stdout: string
+            stderr: string
+            cancelled: boolean
+          }
+          return { ...result, resolvedNpmVersion: '1.2.0' }
+        }
+        return await runDshPlugin(profile, args) as {
+          exitCode: number | null
+          timedOut: boolean
+          stdout: string
+          stderr: string
+          cancelled: boolean
+        }
+      },
+      probePnpm: () => Promise.resolve(true),
+      provisionPnpm: () => Promise.resolve({ ok: true }),
+      cancelActive: () => false,
+    })
+
+    const r = await bed.dispatch('POST', '/dsh-market/update', { name: 'dsh-loop' })
+
+    expect(r.status).toBe(200)
+    expect(r.json).toMatchObject({ ok: true })
+    expect(fake.calls.some(call => call[0] === 'add' && call.includes('dsh-loop@latest'))).toBe(true)
+    const installed = JSON.parse(readFileSync(join(fake.profileDir, 'node_modules', 'dsh-loop', 'package.json'), 'utf8')) as { version?: string }
+    expect(installed.version).toBe('1.2.0')
+  })
+
+  it('rejects a floating-tag update whose Desktop pin does not match what landed (#496)', async () => {
+    fake.npm['dsh-loop'].latest = '1.2.0'
+    fake.npm['dsh-loop'].versions['1.2.0'] = { manifest: { dsh: {}, main: 'lib/index.js' }, artifacts: ['lib/index.js'] }
+    fake.npm['dsh-loop'].versions['1.1.0'] = { manifest: { dsh: {}, main: 'lib/index.js' }, artifacts: ['lib/index.js'] }
+    vi.stubGlobal('fetch', () => Promise.reject(new Error('registry offline')))
+    bed.dispose()
+    bed = createTestbed({}, {
+      runPlugin: async (profile, args) => {
+        const target = args.filter(arg => !arg.startsWith('-')).at(-1) ?? ''
+        if (args[0] === 'add' && target === 'dsh-loop@latest') {
+          fake.resolvedNpmVersionOnce = '1.1.0'
+          const result = await runDshPlugin(profile, args) as {
+            exitCode: number | null
+            timedOut: boolean
+            stdout: string
+            stderr: string
+            cancelled: boolean
+          }
+          return { ...result, resolvedNpmVersion: '1.2.0' }
+        }
+        return await runDshPlugin(profile, args) as {
+          exitCode: number | null
+          timedOut: boolean
+          stdout: string
+          stderr: string
+          cancelled: boolean
+        }
+      },
+      probePnpm: () => Promise.resolve(true),
+      provisionPnpm: () => Promise.resolve({ ok: true }),
+      cancelActive: () => false,
+    })
+
+    const r = await bed.dispatch('POST', '/dsh-market/update', { name: 'dsh-loop' })
+
+    expect(r.status).toBe(502)
+    expect(r.json).toMatchObject({ ok: false, failureCode: 'RESOLVED_VERSION_MISMATCH' })
+    expect(installedSpec('dsh-loop')).toBe('^1.0.0')
+  })
+
+  it('skips an update for a plugin already on the registry latest, without touching pnpm (#495)', async () => {
+    // The page's updatable list is a snapshot. A batch that already updated
+    // this plugin a round earlier re-submits it from that snapshot; answering
+    // "已是最新" with a 400 made the batch report failures for work it had
+    // just done correctly. Nothing to install, so nothing to fail.
+    advanceNpmLatest('1.0.0')
+    const callsBefore = fake.calls.length
+
+    const r = await bed.dispatch('POST', '/dsh-market/update', { name: 'dsh-loop' })
+
+    expect(r.status).toBe(200)
+    expect(r.json).toMatchObject({ ok: true, skipped: 'current', name: 'dsh-loop', version: '1.0.0' })
+    expect(fake.calls).toHaveLength(callsBefore)
+    expect(installedSpec('dsh-loop')).toBe('^1.0.0')
+  })
+
+  it('still refuses when the registry latest is OLDER than what is installed (#64)', async () => {
+    // The other half of the same guard, and a different event: the dist-tag
+    // was moved back to a previous release, so updating would walk the
+    // profile backwards. That one the user has to see.
+    advanceNpmLatest('1.2.0')
+    expect((await bed.dispatch('POST', '/dsh-market/update', { name: 'dsh-loop' })).json.ok).toBe(true)
+    advanceNpmLatest('0.9.0')
+    const callsBefore = fake.calls.length
+
+    const r = await bed.dispatch('POST', '/dsh-market/update', { name: 'dsh-loop' })
+
+    expect(r.status).toBe(400)
+    expect(String(r.json.error)).toMatch(/更新会降级|would downgrade/)
+    expect(r.json.skipped).toBeUndefined()
+    expect(fake.calls).toHaveLength(callsBefore)
   })
 
   it('exposes a versioned capability and update-check contract for plugin-owned UIs', async () => {
@@ -1444,18 +1704,50 @@ describe('update flow — no npm publishing required', () => {
     expect(fake.calls.at(-1)).toContain(target)
     expect(installedSpec('plug-a')).toBe(target)
 
-    // A ref and path may share pnpm's fragment. Updating still discards the
-    // ref (so HEAD is re-resolved) but must not discard the package subpath.
+    // A ref and path may share pnpm's fragment. A COMMIT PIN is what an
+    // update discards, so the repository is resolved again rather than the
+    // pin reinstalled — but the package subpath must survive.
     const manifestPath = join(profileDir('web'), 'package.json')
     const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'))
-    manifest.dependencies['plug-a'] = 'github:m/mono#release-1&path:/packages/plug-a'
+    const pin = 'c'.repeat(40)
+    manifest.dependencies['plug-a'] = `github:m/mono#${pin}&path:/packages/plug-a`
     writeFileSync(manifestPath, JSON.stringify(manifest))
 
     const refreshed = await bed.dispatch('POST', '/dsh-market/update', { name: 'plug-a' })
     expect(refreshed.status).toBe(200)
     expect(fake.calls.at(-1)).toContain(target)
-    expect(fake.calls.at(-1)).not.toContain('release-1')
+    expect(fake.calls.at(-1)).not.toContain(pin)
     expect(installedSpec('plug-a')).toBe(target)
+  })
+
+  it('keeps the branch an update was installed from, alongside the subpath (#446)', async () => {
+    // #281 dropped every revision selector, which was right for a pin and
+    // wrong for a branch: `github:owner/repo#publish` names the line of
+    // development the user chose, and discarding it moved them to the
+    // default branch under the word "update" — a source change, not an
+    // update. The pin case above still drops.
+    const target = 'github:m/mono#publish&path:/packages/plug-b'
+    fake.repos[target] = {
+      name: 'plug-b', manifest: { dsh: {}, main: 'index.js' }, artifacts: ['index.js'],
+    }
+    fake.repos['github:m/mono#path:/packages/plug-b'] = {
+      name: 'plug-b', manifest: { dsh: {}, main: 'index.js' }, artifacts: ['index.js'],
+    }
+    const installed = await bed.dispatch('POST', '/dsh-market/install', {
+      url: 'https://github.com/m/mono/tree/main/packages/plug-b',
+    })
+    expect(installed.status).toBe(200)
+
+    const manifestPath = join(profileDir('web'), 'package.json')
+    const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'))
+    manifest.dependencies['plug-b'] = target
+    writeFileSync(manifestPath, JSON.stringify(manifest))
+
+    const refreshed = await bed.dispatch('POST', '/dsh-market/update', { name: 'plug-b' })
+    expect(refreshed.status).toBe(200)
+    // The whole target, not a substring: fake.calls entries are argv arrays,
+    // so an exact element is what proves both selectors survived together.
+    expect(fake.calls.at(-1)).toContain(target)
   })
 
   it('does not offer a rollback that the real CLI cannot execute for a github subpath', async () => {
@@ -1605,7 +1897,7 @@ describe('update flow — no npm publishing required', () => {
     expect(readFileSync(join(fake.profileDir, 'node_modules', 'dsh-loop', 'lib', 'index.js'), 'utf8')).toBe('old-build')
     expect(existsSync(lockfilePath)).toBe(false)
     expect(fake.calls.slice(callsBefore).filter(call => call[0] === 'add')).toEqual([
-      ['add', 'dsh-loop@latest'],
+      ['add', 'dsh-loop@1.3.0'],
       ['add', '--force', '--config.minimumReleaseAge=0', 'dsh-loop@1.0.0'],
     ])
   })
@@ -2208,7 +2500,10 @@ describe('update flow — no npm publishing required', () => {
     // Exercise the China path: the update target itself is already pinned
     // after HEAD is resolved through the mirror. Rollback must replace that
     // pin, not append a second `#` to it (#385).
-    vi.stubGlobal('fetch', vi.fn(async () => new Response(`001e${NEW} HEAD\0multi_ack\n`, { status: 200 })))
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(
+      `001e# service=git-upload-pack\n00000155${NEW} HEAD\0multi_ack\n003f${NEW} refs/heads/main\n0000`,
+      { status: 200 },
+    )))
     bed.dispose()
     bed = createTestbed({ region: 'china' })
 
@@ -2403,7 +2698,7 @@ describe('update flow — no npm publishing required', () => {
     expect(r.status).toBe(409)
     expect(r.json).toMatchObject({ ok: false, busy: true })
     expect(runPlugin.mock.calls).toEqual([
-      ['web', ['add', 'dsh-loop@latest']],
+      ['web', ['add', 'dsh-loop@1.2.0']],
       ['web', ['store', 'path']],
     ])
     expect(installedSpec('dsh-loop')).toBe('^1.0.0')
@@ -2567,6 +2862,46 @@ describe('local-dev restore flow', () => {
     expect(String(r.json.error)).toMatch(/No catalog entry/)
   })
 
+  it('returns 400 when restore repo evidence disagrees with the only same-named catalog entry', async () => {
+    const checkout = join(fake.profileDir, '..', 'humanizer-dev')
+    mkdirSync(checkout, { recursive: true })
+    writeFileSync(join(checkout, 'package.json'), JSON.stringify({
+      name: 'dsh-humanizer',
+      version: '0.1.0',
+      main: 'index.js',
+      dsh: {},
+      repository: { type: 'git', url: 'https://github.com/handsomeliu/dsh-humanizer.git' },
+    }))
+    writeFileSync(join(checkout, 'index.js'), '')
+    writeFileSync(join(fake.profileDir, 'package.json'), JSON.stringify({
+      dependencies: { 'dsh-humanizer': `link:${checkout}` },
+    }))
+    mkdirSync(join(fake.profileDir, 'node_modules', 'dsh-humanizer'), { recursive: true })
+    writeFileSync(join(fake.profileDir, 'node_modules', 'dsh-humanizer', 'package.json'), JSON.stringify({
+      name: 'dsh-humanizer',
+      version: '0.1.0',
+      main: 'index.js',
+      dsh: {},
+      repository: { type: 'git', url: 'https://github.com/handsomeliu/dsh-humanizer.git' },
+    }))
+    registryModule.loadRegistry.mockImplementationOnce(() => Promise.resolve({
+      ...REGISTRY,
+      count: REGISTRY.count + 1,
+      plugins: [
+        ...REGISTRY.plugins,
+        {
+          name: 'dsh-humanizer', owner: 'lynote-ai',
+          url: 'https://github.com/lynote-ai/dsh-humanizer',
+          category: 'tool', npm: 'dsh-humanizer', description: {}, install: '', added: '',
+        },
+      ],
+    }))
+    const r = await bed.dispatch('POST', '/dsh-market/update', { name: 'dsh-humanizer', restore: true })
+    expect(r.status).toBe(400)
+    expect(String(r.json.error)).toMatch(/No catalog entry/)
+    expect(installedSpec('dsh-humanizer')).toBe(`link:${checkout}`)
+  })
+
   /** #250 landed a third target shape — a prebuilt Release archive URL —
    * after this restore path was written. It is neither an npm name nor a
    * `github:` shortcut, so the dist-tag branch would have handed pnpm
@@ -2650,6 +2985,28 @@ describe('local-dev restore flow', () => {
 })
 
 describe('uninstall flow', () => {
+  it('does not call the uninstall hot when a native addon is involved (#441)', async () => {
+    // Node has no dlclose: once a `.node` is loaded the process holds it
+    // until it exits, so unmounting the plugin does not release the file.
+    // Reporting `hot` would tell the page a refresh is enough — and on
+    // Windows the next install of the same plugin then fails renaming over
+    // the copy this process is still holding, which is what @yandidan1 hit.
+    fake.npm['dsh-loop'] = { latest: '1.0.0', versions: { '1.0.0': { manifest: { dsh: {}, main: 'lib/index.js' }, artifacts: ['lib/index.js'] } } }
+    await bed.dispatch('POST', '/dsh-market/install', { url: 'https://github.com/o/dsh-loop' })
+    // The plugin is JavaScript; the addon is a dependency hoisted beside it.
+    const installedManifest = join(fake.profileDir, 'node_modules', 'dsh-loop', 'package.json')
+    const manifest = JSON.parse(readFileSync(installedManifest, 'utf8')) as Record<string, unknown>
+    writeFileSync(installedManifest, JSON.stringify({ ...manifest, dependencies: { 'node-hid': '3.4.0' } }))
+    mkdirSync(join(fake.profileDir, 'node_modules', 'node-hid', 'build', 'Release'), { recursive: true })
+    writeFileSync(join(fake.profileDir, 'node_modules', 'node-hid', 'package.json'), '{"name":"node-hid","version":"3.4.0"}')
+
+    const r = await bed.dispatch('POST', '/dsh-market/uninstall', { name: 'dsh-loop' })
+
+    expect(r.status).toBe(200)
+    expect(r.json.hot).toBe(false)
+    expect(installedSpec('dsh-loop')).toBeUndefined()
+  })
+
   it('removes the plugin (live when hot mounted) and protects the market itself', async () => {
     fake.npm['dsh-loop'] = { latest: '1.0.0', versions: { '1.0.0': { manifest: { dsh: {}, main: 'lib/index.js' }, artifacts: ['lib/index.js'] } } }
     await bed.dispatch('POST', '/dsh-market/install', { url: 'https://github.com/o/dsh-loop' })
@@ -3176,6 +3533,24 @@ describe('one-click restart guards (#14)', () => {
     expect((await bed.dispatch('POST', '/dsh-market/restart', {})).status).toBe(403)
     expect(restartCalls.count).toBe(0)
   })
+
+  it('refuses while the host is under a debugger (#447)', async () => {
+    debuggerLatch.value = 'inspector'
+    const status = await bed.dispatch('GET', '/dsh-market/status')
+    expect(status.json.restart).toBe(true)
+    expect(status.json.debugger).toBe('inspector')
+    expect((await bed.dispatch('POST', '/dsh-market/restart', {})).status).toBe(403)
+    expect(restartCalls.count).toBe(0)
+  })
+
+  it('allowRestart: true does not override the debugger latch (#447)', async () => {
+    bed.dispose()
+    bed = createTestbed({ allowRestart: true })
+    debuggerLatch.value = 'inspector'
+    expect((await bed.dispatch('GET', '/dsh-market/status')).json.restart).toBe(true)
+    expect((await bed.dispatch('POST', '/dsh-market/restart', {})).status).toBe(403)
+    expect(restartCalls.count).toBe(0)
+  })
 })
 
 describe('bundle-layer uninstall live-disable (#37)', () => {
@@ -3578,6 +3953,42 @@ describe('self-uninstall — the market removing itself from its settings card',
 })
 
 describe('download region', () => {
+  it('does not let a late automatic probe replace a manual region choice', async () => {
+    let finishProbe!: (value: { region: 'china'; probed: true }) => void
+    regionProbe.pending = new Promise(resolve => { finishProbe = resolve })
+    bed.dispose()
+    bed = createTestbed({ region: undefined })
+
+    expect((await bed.dispatch('POST', '/dsh-market/region', { region: 'global' })).status).toBe(200)
+    finishProbe({ region: 'china', probed: true })
+    await new Promise(resolve => setTimeout(resolve, 0))
+
+    expect((await bed.dispatch('GET', '/dsh-market/status')).json.region).toBe('global')
+    expect(hot.region).toBe('global')
+    expect(hot.regionAuto).toBeUndefined()
+  })
+
+  it('does not let a disposed mount apply its late automatic probe', async () => {
+    let finishProbe!: (value: { region: 'china'; probed: true }) => void
+    regionProbe.pending = new Promise(resolve => { finishProbe = resolve })
+    bed.dispose()
+    const staleMount = createTestbed({ region: undefined })
+    staleMount.dispose()
+
+    bed = createTestbed({ region: 'global' })
+    expect((await bed.dispatch('POST', '/dsh-market/region', { region: 'global' })).status).toBe(200)
+    expect((await bed.dispatch('POST', '/dsh-market/note', {
+      name: 'dsh-loop', text: 'new mount owns this note',
+    })).status).toBe(200)
+    finishProbe({ region: 'china', probed: true })
+    await new Promise(resolve => setTimeout(resolve, 0))
+
+    expect(hot.notes).toEqual({ 'dsh-loop': 'new mount owns this note' })
+    expect((await bed.dispatch('GET', '/dsh-market/status')).json.region).toBe('global')
+    expect(hot.region).toBe('global')
+    expect(hot.regionAuto).toBeUndefined()
+  })
+
   it('rejects anything but the two regions', async () => {
     expect((await bed.dispatch('POST', '/dsh-market/region', { region: 'CN' })).status).toBe(400)
     expect((await bed.dispatch('POST', '/dsh-market/region', {})).status).toBe(400)
@@ -3607,7 +4018,52 @@ describe('download region', () => {
     const proxy = (await bed.dispatch('GET', '/dsh-market/status')).json.githubProxy
     expect(typeof proxy).toBe('string')
     expect(String(proxy).startsWith('https://')).toBe(true)
+    const candidates = (await bed.dispatch('GET', '/dsh-market/status')).json.githubRoutes
+    expect(candidates.raw).toEqual(['https://gh-proxy.com', 'https://ghfast.top', null])
+    expect(candidates.git[0]).toBeNull()
+    expect(candidates.avatar[0]).toBeNull()
     await bed.dispatch('POST', '/dsh-market/region', { region: 'global' })
+  })
+
+  it('persists one custom GitHub escape route and can restore automatic routing', async () => {
+    const set = await bed.dispatch('POST', '/dsh-market/github-proxy', {
+      proxy: 'https://mirror.example/prefix/',
+    })
+    expect(set.status).toBe(200)
+    expect(set.json.githubProxyCustom).toBe('https://mirror.example/prefix')
+    expect(hot.githubProxy).toBe('https://mirror.example/prefix')
+    let status = (await bed.dispatch('GET', '/dsh-market/status')).json
+    expect(status.githubRoutes.raw).toEqual(['https://mirror.example/prefix', null])
+    expect(status.githubProxyCustom).toBe('https://mirror.example/prefix')
+
+    const clear = await bed.dispatch('POST', '/dsh-market/github-proxy', { proxy: null })
+    expect(clear.status).toBe(200)
+    expect(hot.githubProxy).toBeUndefined()
+    status = (await bed.dispatch('GET', '/dsh-market/status')).json
+    expect(status.githubProxyCustom).toBeNull()
+    expect(status.githubRoutes.raw).toEqual([null])
+  })
+
+  it('rejects unsafe custom prefixes and refuses UI writes while the environment owns the route', async () => {
+    for (const proxy of [
+      'http://mirror.example',
+      'https://user:secret@mirror.example',
+      'https://mirror.example/?token=secret',
+      'not a url',
+    ]) {
+      expect((await bed.dispatch('POST', '/dsh-market/github-proxy', { proxy })).status).toBe(400)
+    }
+    expect((await bed.dispatch('POST', '/dsh-market/github-proxy', {
+      proxy: 'https://mirror.example',
+    }, { crossOrigin: true })).status).toBe(403)
+
+    bed.dispose()
+    process.env.DSHM_GITHUB_PROXY = 'https://env.example'
+    bed = createTestbed({ region: 'china' })
+    const status = (await bed.dispatch('GET', '/dsh-market/status')).json
+    expect(status.githubProxyManaged).toBe(true)
+    expect(status.githubRoutes.raw).toEqual(['https://env.example', null])
+    expect((await bed.dispatch('POST', '/dsh-market/github-proxy', { proxy: null })).status).toBe(409)
   })
 
   it('stops offering the automatic explanation once the user has chosen', async () => {
@@ -3645,20 +4101,39 @@ describe('release channel', () => {
     // The offer and the install have to agree. `@latest` was hardcoded, so a
     // beta subscriber would be told an update existed and then handed the
     // stable build — the setting would look like it did nothing.
-    fake.npm['dshmarket'] = { latest: '1.0.0', versions: { '1.0.0': { manifest: { dsh: {}, main: 'lib/index.js' }, artifacts: ['lib/index.js'] } } }
+    //
+    // The add target is the exact pin the channel resolved (#496), not the
+    // dist-tag itself: Desktop's install boundary would otherwise re-fetch
+    // `latest` and drift. What must still hold is that beta does not install
+    // the stable release.
+    fake.npm['dshmarket'] = {
+      latest: '1.0.0',
+      versions: {
+        '1.0.0': { manifest: { dsh: {}, main: 'lib/index.js' }, artifacts: ['lib/index.js'] },
+        '9.0.0': { manifest: { dsh: {}, main: 'lib/index.js' }, artifacts: ['lib/index.js'] },
+        '9.1.0-beta.1': { manifest: { dsh: {}, main: 'lib/index.js' }, artifacts: ['lib/index.js'] },
+      },
+    }
     await bed.dispatch('POST', '/dsh-market/install', { url: 'https://github.com/o/dshmarket' })
     fake.npm['dshmarket'].latest = '9.0.0'
-    fake.npm['dshmarket'].versions['9.0.0'] = { manifest: { dsh: {}, main: 'lib/index.js' }, artifacts: ['lib/index.js'] }
     await bed.dispatch('POST', '/dsh-market/channel', { channel: 'beta' })
+    vi.stubGlobal('fetch', (url: string) => {
+      const u = String(url)
+      if (u.includes('/beta')) {
+        return Promise.resolve(new Response(JSON.stringify({ version: '9.1.0-beta.1' }), { status: 200 }))
+      }
+      return Promise.resolve(new Response(JSON.stringify({ version: '9.0.0' }), { status: 200 }))
+    })
     fake.calls = []
     await bed.dispatch('POST', '/dsh-market/update', { name: 'dshmarket' })
     const added = fake.calls.find(call => call[0] === 'add')
-    expect(added?.join(' '), 'the update ran with the wrong dist-tag').toContain('dshmarket@beta')
+    expect(added?.join(' '), 'the update ran with the wrong channel pin').toContain('dshmarket@9.1.0-beta.1')
+    expect(added?.join(' ')).not.toContain('dshmarket@9.0.0')
 
     await bed.dispatch('POST', '/dsh-market/channel', { channel: 'stable' })
     fake.calls = []
     await bed.dispatch('POST', '/dsh-market/update', { name: 'dshmarket' })
-    expect(fake.calls.find(call => call[0] === 'add')?.join(' ')).toContain('dshmarket@latest')
+    expect(fake.calls.find(call => call[0] === 'add')?.join(' ')).toContain('dshmarket@9.0.0')
   })
 
   it('re-checks immediately when the channel changes', async () => {
@@ -3787,5 +4262,136 @@ describe('the dev channel is an ordinary choice', () => {
   it('still refuses a cross-origin selection', async () => {
     expect((await bed.dispatch('POST', '/dsh-market/channel', { channel: 'dev' }, { crossOrigin: true })).status).toBe(403)
     expect(hot.channel).toBeUndefined()
+  })
+})
+
+
+          describe('git to npm source migration (#461)', () => {
+            it('offers an explicit migration and renames package-owned user state', async () => {
+              const dir = profileDir('web')
+              writeFileSync(join(dir, 'package.json'), JSON.stringify({
+                dependencies: { 'dsh-genui': 'github:omdsh-dev/dsh-genui' },
+              }))
+              mkdirSync(join(dir, 'node_modules', 'dsh-genui'), { recursive: true })
+              writeFileSync(join(dir, 'node_modules', 'dsh-genui', 'package.json'), JSON.stringify({
+                name: 'dsh-genui', version: '0.9.6', main: 'index.js',
+              }))
+              writeFileSync(join(dir, 'node_modules', 'dsh-genui', 'index.js'), '')
+              fake.npm['@changfenhuang/dsh-genui'] = {
+                latest: '0.9.7',
+                versions: {
+                  '0.9.7': {
+                    manifest: { name: '@changfenhuang/dsh-genui', main: 'index.js' },
+                    artifacts: ['index.js'],
+                  },
+                },
+              }
+              hot.disabled.add('dsh-genui')
+              hot.groups.work = ['dsh-genui']
+              hot.groupOrder.push('work')
+              hot.notes['dsh-genui'] = 'legacy source'
+
+              const updates = await bed.dispatch('GET', '/dsh-market/updates?force=1')
+              expect(updates.status).toBe(200)
+              expect(updates.json.updates['dsh-genui'].sourceMigration).toEqual({
+                kind: 'git-to-npm',
+                repo: 'omdsh-dev/dsh-genui',
+                target: '@changfenhuang/dsh-genui',
+              })
+
+              const migrated = await bed.dispatch('POST', '/dsh-market/migrate-source', { name: 'dsh-genui' })
+              expect(migrated.status).toBe(200)
+              expect(migrated.json).toMatchObject({
+                ok: true,
+                from: { name: 'dsh-genui', source: 'github:omdsh-dev/dsh-genui' },
+                to: { name: '@changfenhuang/dsh-genui', source: 'npm' },
+              })
+              expect(installedSpec('dsh-genui')).toBeUndefined()
+              expect(installedSpec('@changfenhuang/dsh-genui')).toBe('^0.9.7')
+              expect(hot.disabled.has('@changfenhuang/dsh-genui')).toBe(true)
+              expect(hot.disabled.has('dsh-genui')).toBe(false)
+              expect(hot.groups.work).toEqual(['@changfenhuang/dsh-genui'])
+              expect(hot.notes['@changfenhuang/dsh-genui']).toBe('legacy source')
+              expect(hot.notes['dsh-genui']).toBeUndefined()
+            })
+
+            it('does not offer or execute migration for an explicit Git ref', async () => {
+              const dir = profileDir('web')
+              writeFileSync(join(dir, 'package.json'), JSON.stringify({
+                dependencies: { 'dsh-genui': 'github:omdsh-dev/dsh-genui#publish' },
+              }))
+              mkdirSync(join(dir, 'node_modules', 'dsh-genui'), { recursive: true })
+              writeFileSync(join(dir, 'node_modules', 'dsh-genui', 'package.json'), JSON.stringify({
+                name: 'dsh-genui', version: '0.9.6', main: 'index.js',
+              }))
+              writeFileSync(join(dir, 'node_modules', 'dsh-genui', 'index.js'), '')
+
+              const updates = await bed.dispatch('GET', '/dsh-market/updates?force=1')
+              expect(updates.json.updates['dsh-genui'].sourceMigration).toBeUndefined()
+              const migrated = await bed.dispatch('POST', '/dsh-market/migrate-source', { name: 'dsh-genui' })
+              expect(migrated.status).toBe(400)
+              expect(installedSpec('dsh-genui')).toBe('github:omdsh-dev/dsh-genui#publish')
+            })
+          })
+describe('favorites (#414)', () => {
+  it('adds and removes a catalog url and returns it from GET /installed', async () => {
+    const url = 'https://github.com/o/dsh-loop'
+    const add = await bed.dispatch('POST', '/dsh-market/favorite', { url, favorited: true })
+    expect(add.status).toBe(200)
+    expect(add.json.favorites).toEqual([url])
+    expect(hot.favorites).toEqual([url])
+
+    const listed = await bed.dispatch('GET', '/dsh-market/installed')
+    expect(listed.json.favorites).toEqual([url])
+
+    const remove = await bed.dispatch('POST', '/dsh-market/favorite', { url, favorited: false })
+    expect(remove.status).toBe(200)
+    expect(remove.json.favorites).toEqual([])
+    expect(hot.favorites).toEqual([])
+  })
+
+  it('rejects invalid urls and cross-origin writes', async () => {
+    expect((await bed.dispatch('POST', '/dsh-market/favorite', { url: '', favorited: true })).status).toBe(400)
+    expect((await bed.dispatch('POST', '/dsh-market/favorite', { url: 'ftp://bad', favorited: true })).status).toBe(400)
+    expect((await bed.dispatch('POST', '/dsh-market/favorite', { url: 'https://github.com/o/x', favorited: true }, { crossOrigin: true })).status).toBe(403)
+  })
+
+  it('a disable toggle does not clear favorites', async () => {
+    fake.npm['dsh-loop'] = {
+      latest: '1.0.0',
+      versions: { '1.0.0': { manifest: { dsh: {}, main: 'lib/index.js' }, artifacts: ['lib/index.js'] } },
+    }
+    await bed.dispatch('POST', '/dsh-market/install', { url: 'https://github.com/o/dsh-loop' })
+    await bed.dispatch('POST', '/dsh-market/favorite', { url: 'https://github.com/h/dsh-share', favorited: true })
+    await bed.dispatch('POST', '/dsh-market/toggle', { name: 'dsh-loop', enabled: false })
+    expect(hot.favorites).toEqual(['https://github.com/h/dsh-share'])
+  })
+
+  it('rejects favorites beyond MAX_FAVORITES', async () => {
+    hot.favorites = Array.from({ length: 500 }, (_, index) => `https://github.com/o/p-${index}`)
+    const add = await bed.dispatch('POST', '/dsh-market/favorite', { url: 'https://github.com/o/one-more', favorited: true })
+    expect(add.status).toBe(400)
+    expect(hot.favorites).toHaveLength(500)
+  })
+
+  it('queues favorite writes while an install is running', async () => {
+    fake.npm['dsh-loop'] = {
+      latest: '1.0.0',
+      versions: { '1.0.0': { manifest: { dsh: {}, main: 'lib/index.js' }, artifacts: ['lib/index.js'] } },
+    }
+    let release!: () => void
+    fake.gate = new Promise<void>((resolvePromise) => { release = resolvePromise })
+    const install = bed.dispatch('POST', '/dsh-market/install', { url: 'https://github.com/o/dsh-loop' })
+    await new Promise(resolvePromise => setTimeout(resolvePromise, 20))
+    const favorite = bed.dispatch('POST', '/dsh-market/favorite', {
+      url: 'https://github.com/o/dsh-share',
+      favorited: true,
+    })
+    release()
+    fake.gate = null
+    expect((await install).status).toBe(200)
+    const fav = await favorite
+    expect(fav.status).toBe(200)
+    expect(fav.json.favorites).toEqual(['https://github.com/o/dsh-share'])
   })
 })

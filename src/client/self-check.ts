@@ -20,6 +20,37 @@
  * anything on its own; it is evidence, collected before it is needed.
  */
 
+import { api } from './market-data.ts'
+import { lastMarketCrash } from './ErrorBoundary.tsx'
+
+/**
+ * Download the exported log: the server's account plus what only the browser
+ * can see.
+ *
+ * A free function rather than a hook, because the market's error boundary
+ * has to offer it too — a crashed market is exactly when the log matters,
+ * and for months it was exactly when the button did not exist (#293).
+ * @throws when the server half cannot be fetched; callers show their own state.
+ */
+export async function exportMarketLog(): Promise<void> {
+  const res = await fetch(api('/dsh-market/logs'))
+  if (!res.ok) throw new Error(`HTTP ${String(res.status)}`)
+  const serverText = await res.text()
+  const browser = clientDiagnostics()
+  const blob = new Blob(
+    [serverText, ...(browser.length > 0 ? ['## browser\n', browser.join('\n'), '\n'] : [])],
+    { type: 'text/plain;charset=utf-8' },
+  )
+  const url = URL.createObjectURL(blob)
+  const anchor = document.createElement('a')
+  anchor.href = url
+  anchor.download = 'dsh-market-log.txt'
+  document.body.appendChild(anchor)
+  anchor.click()
+  anchor.remove()
+  URL.revokeObjectURL(url)
+}
+
 /**
  * How many times this module has been evaluated in this page.
  *
@@ -36,6 +67,36 @@
  */
 const globals = globalThis as typeof globalThis & { __dshmarketClientLoads?: number }
 globals.__dshmarketClientLoads = (globals.__dshmarketClientLoads ?? 0) + 1
+
+/**
+ * The marks Chrome and Edge leave on `<html>` when they translate a page.
+ *
+ * Both add a `translated-*` class for the direction they rendered into; Edge
+ * also flags the document it worked on. Reported verbatim rather than
+ * reduced to a boolean, because which engine did it is the next question
+ * after "was it translated at all".
+ * @returns the marks found, or null when there are none.
+ */
+function translatedMarks(): string | null {
+  const root = document.documentElement
+  const marks = [
+    ...[...root.classList].filter(name => name.startsWith('translated')),
+    ...(root.hasAttribute('_msthash') ? ['edge (_msthash)'] : []),
+    ...(root.hasAttribute('_msttexthash') ? ['edge (_msttexthash)'] : []),
+  ]
+  return marks.length === 0 ? null : marks.join(', ')
+}
+
+/** The market crash the error boundary caught, if there was one. */
+function crashLines(): string[] {
+  const crash = lastMarketCrash()
+  if (crash === null) return []
+  return [
+    `market UI crashed at: ${crash.at}`,
+    `market crash message: ${crash.message}`,
+    ...(crash.stack === null ? [] : [`market crash component stack:${crash.stack}`]),
+  ]
+}
 
 /** Whether `value` looks like a browser environment worth inspecting. */
 const hasDom = (): boolean => typeof document !== 'undefined' && document.body !== null
@@ -69,8 +130,18 @@ export function clientDiagnostics(): string[] {
     `plugin cards rendered: ${String(document.querySelectorAll('[data-dsh-market-root] [class*="_card"]').length)}`,
     // The mount point every /dsh-market/* request is resolved against (#345).
     // A surprising value here explains a whole class of "nothing loads".
+    // #293: browser page translation replaces text nodes underneath React,
+    // which is the one reported cause of the blank market. Chrome and Edge
+    // mark the document when they do it, so a report can now say so without
+    // the reporter having to notice. A fact, not a verdict — a translated
+    // page is not by itself a fault.
+    `page translated by the browser: ${translatedMarks() ?? 'no'}`,
     `document baseURI: ${document.baseURI}`,
     `page URL: ${location.origin}${location.pathname}`,
+    // A crash the error boundary caught. Reported after the DOM facts
+    // because it is the one line that already IS a diagnosis — and when it
+    // is present, it is the first thing worth reading.
+    ...crashLines(),
     `user agent: ${navigator.userAgent}`,
   ]
 }

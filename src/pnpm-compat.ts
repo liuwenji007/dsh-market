@@ -47,10 +47,21 @@ export interface PnpmFailure {
   code: 'adding-to-root' | 'not-a-workspace' | 'hoist-pattern-diff' | 'pnpm-missing' | 'release-age-violation'
     | 'ignored-builds' | 'git-prepare-not-allowed' | 'fetch-404' | 'transient-network' | 'fetch-timeout'
     | 'unexpected-store' | 'patch-failed' | 'missing-tarball-integrity' | 'windows-file-locked'
+    | 'pnpm-unusable' | 'missing-local-dependency'
   /** Bilingual, actionable message shown to the user instead of the raw wall of text. */
   message: string
   /** True when re-running `pnpm install` in the profile is the documented recovery. */
   recoverable: boolean
+  /**
+   * Show this message INSTEAD of the captured output, not after it.
+   *
+   * Normally the raw text is worth keeping: it is pnpm's own account of what
+   * happened, and the explanation sits under it. Set only where the captured
+   * bytes carry nothing a user can read — cmd.exe writes its errors in the
+   * OEM code page, which arrives here as replacement characters, so pasting
+   * them under an explanation adds noise and hides the explanation (#502).
+   */
+  replaceOutput?: boolean
   /**
    * The package pnpm could not resolve, when the failure names one.
    *
@@ -165,9 +176,13 @@ function integrityViolators(diagnostic: string): string[] {
  * dsh's own wrapper line ("dsh: pnpm failed in profile directory …") names no
  * cause, so the market must recognize pnpm's real diagnostics itself (#20).
  * @param output - stdout+stderr of the failed run.
+ * @param exitCode - the run's exit status, when the caller has it (null when
+ *   the process was signalled). Only a
+ *   failure whose whole signal IS the status reads it (#502); everything else
+ *   is recognized from what pnpm said.
  * @returns the classified failure, or null when unrecognized (raw output is then shown as-is).
  */
-export function classifyPnpmFailure(output: string): PnpmFailure | null {
+export function classifyPnpmFailure(output: string, exitCode?: number | null): PnpmFailure | null {
   if (output.includes('ERR_PNPM_PUBLIC_HOIST_PATTERN_DIFF')
     || output.includes('ERR_PNPM_VIRTUAL_STORE_DIR_MAX_LENGTH_DIFF')) {
     return {
@@ -317,16 +332,29 @@ export function classifyPnpmFailure(output: string): PnpmFailure | null {
   }
   // #389 by @qq1054435284: on Windows, pnpm stages the new version in a
   // sibling `<name>_tmp_<pid>_<n>` directory and renames it over the old one.
-  // Windows refuses that rename while any file underneath the target is open
-  // — and for an UPDATE the target is a plugin the running dsh has loaded, so
-  // its own files are exactly the ones held open. POSIX does not have this
-  // problem: replacing an open file there leaves the old inode alive for
-  // whoever still holds it.
+  // Windows refuses that rename while any file underneath the target is open,
+  // and the process holding them is usually the one asking. POSIX does not
+  // have this problem: replacing an open file there leaves the old inode
+  // alive for whoever still holds it.
+  //
+  // Worded for the RENAME, not for an update (#441 by @yandidan1). The
+  // reporter met this while INSTALLING — a reinstall of a plugin they had
+  // just uninstalled — and was told their update had not applied, that their
+  // existing version was intact, and to disable the plugin under Installed,
+  // which they had already removed. The package pnpm names here is also not
+  // necessarily a plugin: theirs was `node-hid`, a dependency.
+  //
+  // The native-module sentence is the part that makes the advice usable in
+  // that case. Node never unloads a native addon: once a `.node` is loaded
+  // there is no dlclose, so disabling the plugin, unmounting it, or
+  // uninstalling it cannot release the file — only ending the process does.
+  // That is why "uninstall, then install again" fails on Windows for those
+  // plugins while it works for every other one.
   //
   // Not retried automatically. A retry from inside the same process cannot
   // win, because that process is the thing holding the handles; retrying
   // would only turn one clear failure into several slow ones. So this names
-  // the cause and the two ways out instead of guessing.
+  // the cause and the ways out instead of guessing.
   if (/ERR_PNPM_EPERM|EPERM: operation not permitted, rename/i.test(output)) {
     // Read through the NDJSON reporter like the integrity classifier does:
     // in production this arrives JSON-escaped, so every separator is doubled
@@ -340,7 +368,7 @@ export function classifyPnpmFailure(output: string): PnpmFailure | null {
       code: 'windows-file-locked',
       recoverable: false,
       ...(pkg === undefined ? {} : { pkg }),
-      message: `Windows 不允许替换正在被打开的文件，而更新一个插件${zh}要替换的正是当前 DeepSeek Harness 已经加载的那些文件，所以 pnpm 改名失败、更新没有生效（原来的版本没有被破坏，仍可正常使用）。两种做法：完全退出 DeepSeek Harness 后在命令行执行一次更新；或先在「已安装」里停用该插件、重启、再更新。杀毒软件或文件索引临时占用目录也会造成同样的报错，若上述都不适用可稍后重试 / Windows will not replace a file that is open, and updating a plugin${en} replaces exactly the files the running DeepSeek Harness has loaded, so pnpm's rename failed and the update did not apply (the existing version is intact and still works). Two ways round it: quit DeepSeek Harness completely and run the update from the command line, or disable the plugin under Installed, restart, then update. Antivirus or a file indexer holding the directory produces the same error, so a later retry is worth trying if neither applies`,
+      message: `Windows 不允许替换正在被打开的文件。pnpm 要用新目录替换${zh === '' ? '一个已装好的包' : ` ${pkg!}`}，而它的文件正被运行中的 DeepSeek Harness 打开着，改名因此失败，这一步没有生效——已经装好的内容没有被破坏。\n如果这个包带原生模块（.node 文件，例如 node-hid 这类），那么停用插件、甚至卸载插件都不够：原生模块一旦被加载，在进程退出前都不会释放。刚卸载完立刻重装同一个插件在 Windows 上失败，通常就是这个原因。\n可行的做法：完全退出 DeepSeek Harness（不是刷新页面），重新启动后再操作一次；或退出后在命令行执行。杀毒软件或文件索引临时占用目录也会报同样的错，若都不适用可稍后重试。 / Windows will not replace a file that is open. pnpm tried to swap a new directory over${en === '' ? ' an installed package' : en}, whose files the running DeepSeek Harness holds open, so the rename failed and this step did not apply — what was already installed is intact. If that package ships a native module (a .node file, node-hid and friends), disabling the plugin — even uninstalling it — is not enough: once a native module is loaded it is not released until the process exits, which is the usual reason reinstalling a plugin right after uninstalling it fails on Windows. What works: quit DeepSeek Harness completely (not a page refresh), start it again, and repeat the operation; or run it from the command line with the app closed. Antivirus or a file indexer holding the directory produces the same error, so a later retry is worth trying if neither applies.`,
     }
   }
   // #83: pnpm replays the WHOLE dependency tree on every add/remove, so a
@@ -372,6 +400,79 @@ export function classifyPnpmFailure(output: string): PnpmFailure | null {
       code: 'pnpm-missing',
       recoverable: false,
       message: '找不到 pnpm，请先在市场页顶部一键安装组件 / pnpm is not on PATH — use the one-click setup at the top of the market page',
+    }
+  }
+  // Reported by @screamff on #436: a `file:` dependency whose tarball or
+  // directory is no longer on disk. pnpm re-resolves every direct dependency
+  // before ANY mutation, so one dead local path blocks every install and
+  // uninstall in the profile — including uninstalling the market, which is
+  // what the reporter was trying to do. Same family as the #65 ghost
+  // registry entry; the local form has its own error, and it names the PATH
+  // rather than the package, which is why "a plugin is missing" was never a
+  // usable description of it.
+  //
+  // Measured on pnpm 10.28.2 and 11.21.0 (both exit 254): the wording only
+  // differs in how the code is bracketed, and both carry the path and the
+  // "direct dependency" line. Both are required — an ENOENT from a build
+  // script is a different failure and must not wear this explanation.
+  const localMiss = /ENOENT: no such file or directory, open '([^']+)'/.exec(output)
+  if (localMiss !== null && output.includes('while installing a direct dependency')) {
+    return {
+      code: 'missing-local-dependency',
+      recoverable: false,
+      message: `profile 里有一个从本地文件安装的插件，它的文件已经不在了（${localMiss[1]}）。pnpm 在做任何改动前都会重新解析全部直接依赖，所以这一条会挡住这个 profile 里的所有安装和卸载——包括卸载别的插件。请在 profile 的 package.json 的 dependencies 里删掉值等于上面这个路径的那一行（或在市场的「已安装」里卸载它），然后重试。 / a plugin in this profile was installed from a local file that no longer exists (${localMiss[1]}). pnpm re-resolves every direct dependency before making any change, so this one entry blocks every install and uninstall in the profile — including uninstalling other plugins. Remove the dependency whose value is that path from the profile's package.json (or uninstall it from the market's Installed list) and retry.`,
+    }
+  }
+  // #502 by @Ztyss: a pnpm WAS found on PATH and could not be started.
+  //
+  // Different from `pnpm-missing` in the one way that matters to the user:
+  // the market's own setup does not fix it, because as far as PATH is
+  // concerned pnpm is already there. The reported case is a `pnpm.cmd`
+  // wrapper built out of environment variables that only exist in its
+  // installer's own process — expanded in the market's child process it
+  // collapses to an empty command, and cmd.exe answers 9009 with its message
+  // in the OEM code page, which reaches us as replacement characters. Three
+  // updates in a row failed showing the user nothing but that.
+  //
+  // 9009 is cmd.exe's "command not found" and is language-independent, so it
+  // leads; the text forms catch the same failure in a log with no exit code.
+  //
+  // #509 by @awslmowms added the other way a present pnpm fails to run: the
+  // spawn itself is refused, and dsh's wrapper rethrows Node's error
+  // verbatim — `EACCES, syscall: 'spawnSync pnpm'` on Ubuntu. Same class
+  // (pnpm is there, it will not run, and the market's own setup cannot help)
+  // but a different repair, so the message names the reason it was given.
+  //
+  // Last in the chain deliberately: pnpm's own errors never exit 9009 and
+  // never fail to spawn, and anything pnpm actually said has matched above.
+  const spawnRefused = /spawnSync pnpm/.test(output)
+    ? /EACCES/.test(output) ? 'EACCES' : /ENOENT/.test(output) ? 'ENOENT' : 'unknown'
+    : null
+  const cmdNotFound = exitCode === 9009
+    || /is not recognized as an internal or external command|不是内部或外部命令|不是內部或外部命令/.test(output)
+  if (cmdNotFound || spawnRefused !== null) {
+    // Each cause gets the repair that fits it. One generic sentence would
+    // send the EACCES reporter hunting for a missing wrapper variable and
+    // the Windows reporter reaching for chmod.
+    const why = spawnRefused === 'EACCES'
+      ? {
+          zh: '系统拒绝执行它（EACCES，权限不足）。多半是那个文件没有执行权限，或者它所在的分区是以 noexec 挂载的。用 `ls -l $(command -v pnpm)` 看一眼权限位，必要时 `chmod +x`；如果 pnpm 装在 noexec 的分区上，换个位置重装。',
+          en: 'the system refused to execute it (EACCES, permission denied). Usually the file has no execute permission, or it lives on a partition mounted noexec. Check the permission bits with `ls -l $(command -v pnpm)` and `chmod +x` if needed; if pnpm sits on a noexec partition, reinstall it elsewhere.',
+        }
+      : spawnRefused === 'ENOENT'
+        ? {
+            zh: '要执行的文件已经不在了（ENOENT）。PATH 里那条记录指向的 pnpm 被删掉或改名了，重新装一次 pnpm 即可。',
+            en: 'the file it tried to execute is gone (ENOENT). The pnpm that entry on PATH points at has been deleted or renamed; reinstall pnpm.',
+          }
+        : {
+            zh: '命令行没能把它启动起来（退出码 9009）。可能是它其实没装好，也可能它是一个包装脚本、而脚本需要的环境变量在市场启动的子进程里不存在。',
+            en: "the command line could not launch it (exit code 9009). Either it is not installed properly, or it is a wrapper script whose required environment variables are missing in the market's child process.",
+          }
+    return {
+      code: 'pnpm-unusable',
+      recoverable: false,
+      replaceOutput: true,
+      message: `找不到能用的 pnpm，插件没有任何改动。系统里确实有一个 pnpm，但${why.zh}\n在终端里执行一次 \`pnpm --version\` 可以确认：那里同样失败，说明要修的是这台机器上的 pnpm；那里正常，说明是启动市场的方式带来的环境差异，改用普通的 \`dsh web\` 启动可以绕开。 / pnpm could not be started, and nothing was changed. A pnpm does exist on PATH, but ${why.en}\nRun \`pnpm --version\` in a terminal to check: failing there too means pnpm itself needs fixing on this machine; working there means the difference comes from how the market was launched, and starting dsh with a plain \`dsh web\` avoids it.`,
     }
   }
   return null

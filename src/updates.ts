@@ -5,11 +5,11 @@
  */
 
 import { DIST_TAG, type Channel } from './channels.ts'
-import { headCommit } from './accelerate.ts'
+import { resolveHeadCommit } from './accelerate.ts'
 import { marketFetch } from './net.ts'
-import { activeRegion, routesFor } from './regions.ts'
+import { activeRegion } from './regions.ts'
 import { profileDir, readInstalled, readInstalledVersion, readLockCommits } from './profile.ts'
-import { githubCommitOfTarget, repoOfTarget } from './sources.ts'
+import { githubCommitOfTarget, githubRefOfTarget, repoOfTarget } from './sources.ts'
 
 export interface UpdateStatus {
   kind: 'github' | 'npm' | 'linked'
@@ -23,6 +23,8 @@ export interface UpdateStatus {
   updateAvailable: boolean
   /** Taking this update replaces a local package source with its matched online release. */
   restoreRequired?: boolean
+  /** Independent, explicit source switch offered for verified legacy Git installs. */
+  sourceMigration?: { kind: 'git-to-npm'; repo: string; target: string }
   /**
    * The version this package's channel points at, when it differs from what
    * is installed and is NOT newer.
@@ -310,7 +312,12 @@ export async function checkUpdates(
         // stops reporting updates (#349). The ref endpoint git itself uses
         // has no such quota; this is the same call `acceleratedTarget`
         // already makes to resolve a commit for the China region.
-        const latest = await headCommit(repo, routesFor(activeRegion()).githubProxy)
+        // Ask about the ref the install actually names. Answering with the
+        // default branch for a `#branch` install compares two lines that
+        // never converge, so the row reported an update forever (#446).
+        const latest = await resolveHeadCommit(
+          repo, activeRegion(), process.env, githubRefOfTarget(spec) ?? undefined,
+        )
         result[name] = {
           kind: 'github', version, current, latest,
           updateAvailable: current !== null && latest !== null && current !== latest,

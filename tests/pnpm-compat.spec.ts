@@ -97,11 +97,31 @@ describe('classifyPnpmFailure', () => {
     expect(failed?.pkg).toBe('dsh-passwords')
     // Says which plugin, that nothing was broken, and what to do about it.
     expect(failed?.message).toContain('dsh-passwords')
-    expect(failed?.message).toContain('原来的版本没有被破坏')
+    expect(failed?.message).toContain('没有被破坏')
     expect(failed?.message).toContain('quit DeepSeek Harness')
     // Not retried: the process that would retry is the one holding the files.
     expect(failed?.recoverable).toBe(false)
     expect(failed?.message).not.toContain('undefined')
+  })
+
+  it('is worded for the rename, so it also fits a reinstall (#441)', () => {
+    // @yandidan1 met this while INSTALLING — a reinstall of a plugin they had
+    // just uninstalled — and the message told them their UPDATE had not
+    // applied and to disable the plugin under Installed, which no longer
+    // existed. The package pnpm names is a dependency, not their plugin.
+    const failed = classifyPnpmFailure(String.raw`{"name":"pnpm","level":"error","err":{"code":"ERR_PNPM_EPERM","message":"[importPackage C:\p\web\node_modules\node-hid] EPERM: operation not permitted, rename 'C:\p\web\node_modules\node-hid_tmp_9120_3' -> 'C:\p\web\node_modules\node-hid'"}}`)
+
+    expect(failed?.pkg).toBe('node-hid')
+    // Never calls the named package a plugin, and never says "update".
+    expect(failed?.message).not.toContain('更新')
+    expect(failed?.message).not.toMatch(/updating a plugin/)
+    // Names the reason disabling or uninstalling cannot help here.
+    expect(failed?.message).toContain('.node')
+    expect(failed?.message).toContain('刚卸载完立刻重装')
+    expect(failed?.message).toContain('native module')
+    // A page refresh is what the uninstall flow suggests, and it is exactly
+    // the thing that does not release a native module.
+    expect(failed?.message).toContain('not a page refresh')
   })
 
   it('classifies a locked rename with no readable package name (#389)', () => {
@@ -312,5 +332,109 @@ pnpm now wants to use the store at "C:\\Users\\lenovo\\AppData\\Local\\pnpm\\sto
     const failure = classifyPnpmFailure('ERR_PNPM_UNEXPECTED_STORE something reworded upstream')
     expect(failure?.code).toBe('unexpected-store')
     expect(failure?.message).toContain('--store-dir')
+  })
+})
+
+describe('a pnpm that exists on PATH but cannot be started (#502)', () => {
+  // Reported on Windows: the pnpm first on PATH was a `.cmd` wrapper built
+  // out of environment variables that only exist in its installer's own
+  // process. Expanded in the market's child process it collapsed to an empty
+  // command; cmd.exe answered 9009 and wrote its message in the OEM code
+  // page, which arrives here as replacement characters. Three updates in a
+  // row failed showing the user nothing else.
+  const MOJIBAKE = "'\"\"' ��������������\ndsh: pnpm failed in profile directory"
+
+  it('is recognized by the exit status, whatever locale cmd answered in', () => {
+    const failure = classifyPnpmFailure(MOJIBAKE, 9009)
+    expect(failure?.code).toBe('pnpm-unusable')
+    expect(failure?.recoverable).toBe(false)
+  })
+
+  it('replaces the unreadable output instead of appending to it', () => {
+    // The captured bytes are undecodable by construction, so printing them
+    // above the explanation only buries the explanation.
+    expect(classifyPnpmFailure(MOJIBAKE, 9009)?.replaceOutput).toBe(true)
+  })
+
+  it('tells the two causes apart for the user with one command they can run', () => {
+    const message = classifyPnpmFailure(MOJIBAKE, 9009)?.message ?? ''
+    expect(message).toContain('pnpm --version')
+    expect(message).toContain('9009')
+  })
+
+  it('also matches on cmd\'s own wording when no exit status is available', () => {
+    expect(classifyPnpmFailure("'pnpm' is not recognized as an internal or external command,\noperable program or batch file.")?.code).toBe('pnpm-unusable')
+    expect(classifyPnpmFailure("'pnpm' 不是内部或外部命令。")?.code).toBe('pnpm-unusable')
+  })
+
+  it('also covers a spawn the system refused, with the repair that fits it (#509)', () => {
+    // @awslmowms on Ubuntu: pnpm is on PATH and the spawn itself is denied.
+    // dsh's wrapper rethrows Node's error verbatim, so what the user saw was
+    // an argv dump and a Node version banner.
+    const EACCES = String.raw`Error: spawnSync pnpm EACCES
+    at Object.spawnSync (node:internal/child_process:1123:20) {
+  errno: -13,
+  code: 'EACCES',
+  syscall: 'spawnSync pnpm',
+  path: 'pnpm',
+  spawnargs: [ 'add', '-w', 'dshmarket@1.41.0' ]
+}`
+    const failure = classifyPnpmFailure(EACCES, 1)
+    expect(failure?.code).toBe('pnpm-unusable')
+    expect(failure?.replaceOutput).toBe(true)
+    // The repair is specific to being refused execution — not the Windows
+    // wrapper story, which would send this reporter looking for the wrong
+    // thing entirely.
+    expect(failure?.message).toContain('chmod +x')
+    expect(failure?.message).toContain('noexec')
+    expect(failure?.message).not.toContain('9009')
+
+    // A vanished target is a third repair again.
+    const gone = classifyPnpmFailure(String.raw`Error: spawnSync pnpm ENOENT { code: 'ENOENT', syscall: 'spawnSync pnpm' }`, 1)
+    expect(gone?.code).toBe('pnpm-unusable')
+    expect(gone?.message).toContain('ENOENT')
+    expect(gone?.message).not.toContain('chmod +x')
+  })
+
+  it('never outranks a failure pnpm itself reported', () => {
+    // pnpm's own errors never exit 9009. If one somehow arrives with that
+    // status, what pnpm said is the more specific answer and must win.
+    expect(classifyPnpmFailure('ERR_PNPM_ADDING_TO_ROOT  Running this command will add the dependency to the workspace root', 9009)?.code)
+      .toBe('adding-to-root')
+  })
+
+  it('leaves an ordinary failure alone', () => {
+    expect(classifyPnpmFailure('some other failure', 1)).toBeNull()
+  })
+})
+
+describe('a local file: dependency whose file is gone (#436)', () => {
+  // Measured against real pnpm 10.28.2 and 11.21.0, both exit 254. Only the
+  // bracketing of the code differs; both carry the path and the direct-
+  // dependency line.
+  const PNPM_10 = " ENOENT  ENOENT: no such file or directory, open '/home/u/dl/dsh-sandbox-escalation-fix-0.1.2-alpha1.tgz'\n\nThis error happened while installing a direct dependency of /home/u/.dsh/profiles/web\n"
+  const PNPM_11 = "[ENOENT] ENOENT: no such file or directory, open '/home/u/dl/dsh-sandbox-escalation-fix-0.1.2-alpha1.tgz'\n\nThis error happened while installing a direct dependency of /home/u/.dsh/profiles/web\n"
+
+  it('is recognized on both pnpm majors, and names the path', () => {
+    for (const output of [PNPM_10, PNPM_11]) {
+      const failure = classifyPnpmFailure(output, 254)
+      expect(failure?.code).toBe('missing-local-dependency')
+      expect(failure?.recoverable).toBe(false)
+      expect(failure?.message).toContain('dsh-sandbox-escalation-fix-0.1.2-alpha1.tgz')
+    }
+  })
+
+  it('says the entry blocks operations on OTHER plugins, which is how it is met', () => {
+    // The reporter hit it while uninstalling the market, not while touching
+    // the dead entry — "this plugin is broken" would have been useless.
+    const message = classifyPnpmFailure(PNPM_11, 254)?.message ?? ''
+    expect(message).toContain('包括卸载别的插件')
+    expect(message).toContain('blocks every install and uninstall')
+  })
+
+  it('does not claim an ENOENT that is not about a profile dependency', () => {
+    // A build script opening a missing file is a different failure and must
+    // keep pnpm's own words.
+    expect(classifyPnpmFailure("ENOENT: no such file or directory, open '/tmp/whatever'", 1)).toBeNull()
   })
 })

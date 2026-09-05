@@ -15,11 +15,12 @@ import type { IncomingMessage, ServerResponse } from 'node:http'
 import { load as loadYaml } from 'js-yaml'
 import { forgetCatalog, loadRegistry, pluginCategories } from './registry.ts'
 import {
-  cleanHotDir, hotMount, hotUnmount, listHotMounts, MAX_NOTE,
+  cleanHotDir, hotMount, hotUnmount, listHotMounts, MAX_FAVORITES, MAX_NOTE,
   mountClientOnlyDeps, purgeMarketState, readMarketState, writeMarketState,
 } from './hot.ts'
 import { createGroup, deleteGroup, removeFromGroups, renameGroup, setGroupMembers } from './groups.ts'
 import { dshHostInfo } from './dsh-install.ts'
+import { deriveHostCompatibility, DiscoveryManifestIndex } from './discovery-compatibility.ts'
 import { configurePersistentLog, exportLogs, logEvent, readPersistentLog } from './log.ts'
 import { marketFetch } from './net.ts'
 import { diagnosePackageManifests } from './diagnostics.ts'
@@ -27,25 +28,28 @@ import {
   BOOT_ID, cancelActive, probePnpm, progress, provisionPnpm, runDshPlugin, TARGET_RE,
   type PluginCommandRuntime,
 } from './dsh-cli.ts'
-import { addProfileBundle, dropFromManifest, hasLoadableEntry, INBOX_BUNDLES, isDshProfileName, profileDir, readInstalled, readInstalledManifest, readInstalledRepoEvidence, readInstalledVersion, readLockCommits, readProfileBundles, readProfileManifestSnapshot, removeProfileBundle, restoreProfileManifest, setAllowBuilds, type ProfileManifestSnapshot } from './profile.ts'
+import { addProfileBundle, dropFromManifest, hasLoadableEntry, holdsNativeAddon, INBOX_BUNDLES, isDshProfileName, profileDir, readInstalled, readInstalledManifest, readInstalledRepoEvidence, readInstalledVersion, readLockCommits, readProfileBundles, readProfileManifestSnapshot, removeProfileBundle, restoreProfileManifest, setAllowBuilds, type ProfileManifestSnapshot } from './profile.ts'
 import { assessProfile, classifyPeer, introducedDuplicateNames, introducedRisks, type CompatibilityRisk } from './compatibility.ts'
 import { runningAgentIds, type AgentsLookup } from './agents.ts'
-import { analyzeProfile, type DuplicateName } from './check.ts'
+import { analyzeProfile, corePackageNames, type DuplicateName } from './check.ts'
 import { applyBundleOrder, mergeOrder, readBundleRules, readBundleStack, validateOrder } from './order.ts'
 import { applyPreset, deletePreset, listPresets, previewPreset, savePreset } from './presets.ts'
 import { createProfileSnapshot, DEFAULT_MAX_SNAPSHOTS, deleteSnapshot, listSnapshots, restoreSnapshot } from './snapshot.ts'
 import { trialValidate } from './trial.ts'
 import { codeloadAllowBuildsKey, findCatalogEntryForLocal, findInstalledAlias, githubCommitOfTarget, githubTargetAtCommit, gitAllowBuildsKey, installTargetFor, isLocalSpec, NPM_NAME_RE, repoOfTarget, restoreBlockedByWorkspace, restoreTargetForLocal, workspaceProtocolDeps } from './sources.ts'
-import { failureDetail, groupConflictsByOwner, isStaleUpdate, parseIgnoredBuilds, parsePrepareNotAllowed, RELEASE_AGE_OVERRIDE, retargetCollections, validateAddedPlugins, withHoistRecovery } from './install.ts'
+import { failureDetail, groupConflictsByOwner, isStaleUpdate, parseIgnoredBuilds, parsePrepareNotAllowed, pnpmNeverStarted, RELEASE_AGE_OVERRIDE, retargetCollections, validateAddedPlugins, withHoistRecovery } from './install.ts'
 import { asChannel, CHANNELS, DIST_TAG, resolveChannel, type Channel } from './channels.ts'
-import { asRegion, REGIONS, routesFor, setActiveRegion, type Region } from './regions.ts'
+import {
+  asRegion, githubProxyManaged, normalizeGithubProxy, REGIONS, routesFor, setActiveRegion,
+  setCustomGithubProxy, type Region,
+} from './regions.ts'
 import { resolveRegion } from './region-probe.ts'
 import { acceleratedTarget, resolveHeadCommit } from './accelerate.ts'
 import { updateNotesFor } from './changelog.ts'
 import { checkUpdates, compareVersions, fetchNpmLatest, invalidateUpdates, isUpgrade, latestPublishedRecently, setUpdateRegistry, versionOnChannel } from './updates.ts'
 import { createThemeManager, type LoaderEntry } from './themes.ts'
 import { readJsonBody, sameOrigin, sendJson } from './http.ts'
-import { detectedSupervisor, restartAllowed, scheduleRestart, servingPort, trustedRestartRequest, trustedDownloadRequest } from './restart.ts'
+import { detectedDebugger, detectedSupervisor, restartAllowed, scheduleRestart, servingPort, trustedRestartRequest, trustedDownloadRequest } from './restart.ts'
 import { activationAfterReplace, brokenClientBundles, checkClientBundle, hasHostHalf, newlyBrokenBundles, verifyActivation } from './verify.ts'
 import {
   carrierDisableIds, disableRow, enableRow, findUserPatchPath, isProtectedModule, packagePatchFlags,
@@ -59,6 +63,7 @@ import {
   createGist, fitsGistLimit, GistError, gistErrorCode, parseGistId, readGist, resolveGistTokenSource, updateGist, verifyGistToken,
 } from './gist.ts'
 import { MAX_UPDATE_OPERATIONS_V1, UpdateOperationStoreV1, UPDATE_API_V1_SCHEMA } from './update-api-v1.ts'
+import { findGitToNpmMigration } from './source-migration.ts'
 
 export type { LoaderEntry } from './themes.ts'
 export type { UpdateStatus } from './updates.ts'
@@ -138,18 +143,42 @@ export function marketVersion(): string {
 const SELF_NAMES = new Set(['dshmarket', 'dsh-market'])
 
 /**
- * Rebuild a GitHub target for an update: revision selectors are deliberately
- * dropped so pnpm resolves the repository again, while one valid `path:`
- * selector is kept because it identifies the package inside a monorepo.
- * pnpm permits both in one fragment (`#main&path:/packages/plugin`).
+ * Rebuild a GitHub target for an update.
+ *
+ * A commit pin is dropped so pnpm resolves the repository again — that is the
+ * whole point of asking for an update. One valid `path:` selector is kept
+ * because it identifies the package inside a monorepo; pnpm permits both in
+ * one fragment (`#main&path:/packages/plugin`).
+ *
+ * A BRANCH or tag is kept, which used to be the same case as a commit and
+ * was not (#446 by @Dave-12138). `github:owner/repo#publish` names the line
+ * of development the user installed from; dropping it silently moved them to
+ * the default branch on the next update — a source change wearing the word
+ * "update". A 40-character hex selector is a pin worth discarding, and
+ * anything else is a choice worth preserving. A short hex string stays too:
+ * it is indistinguishable from a branch named `abc1234`, and keeping a pin
+ * by mistake only means the update is a no-op, while dropping a branch by
+ * mistake reinstalls different code.
  */
 function githubUpdateTarget(spec: string): string {
   const fragmentAt = spec.indexOf('#')
   if (fragmentAt === -1) return spec
   const repo = spec.slice(0, fragmentAt)
   let subpath: string | null = null
+  let ref: string | null = null
   for (const selector of spec.slice(fragmentAt + 1).split('&')) {
-    if (!selector.startsWith('path:/')) continue
+    if (!selector.startsWith('path:/')) {
+      // `semver:<range>` selects a release line, so it is preserved for the
+      // same reason a branch is.
+      const isCommitPin = /^[0-9a-f]{40}$/i.test(selector)
+      if (selector !== '' && !isCommitPin) {
+        // Two refs in one fragment is not a shape pnpm produces; refuse to
+        // guess which one the user meant and fall back to the bare repo.
+        if (ref !== null) return repo
+        ref = selector
+      }
+      continue
+    }
     const candidate = selector.slice('path:/'.length)
     const valid = /^[A-Za-z0-9_./-]+$/.test(candidate)
       && !candidate.split('/').some(segment => segment === '' || segment === '.' || segment === '..')
@@ -158,8 +187,10 @@ function githubUpdateTarget(spec: string): string {
     if (subpath !== null || !valid) return repo
     subpath = candidate
   }
-  return subpath === null ? repo : `${repo}#path:/${subpath}`
+  const selectors = [...(ref === null ? [] : [ref]), ...(subpath === null ? [] : [`path:/${subpath}`])]
+  return selectors.length === 0 ? repo : `${repo}#${selectors.join('&')}`
 }
+
 
 /**
  * Whether an installed package declares a client part (`dsh.client`). Its UI
@@ -204,6 +235,7 @@ export function mountMarketRoutes(
   commandRuntime?: PluginCommandRuntime,
   agentsLookup?: AgentsLookup,
 ): () => void {
+  let disposed = false
   // An ordinary profile must resolve under DSH_HOME by the same rules as the
   // DSH CLI. A host-authoritative explicit directory (DSH Desktop) does not
   // derive a path from this display/profile name.
@@ -221,6 +253,9 @@ export function mountMarketRoutes(
   }
   const activeProfileDir = profileDir(config.profile, config.profileDirectory)
   const persistentLogFile = join(activeProfileDir, '.dsh-market', 'log.ndjson')
+  const discoveryManifests = new DiscoveryManifestIndex(
+    join(activeProfileDir, '.dsh-market', 'discovery-compatibility-v1.json'),
+  )
   configurePersistentLog(persistentLogFile)
   let agentGuardUnavailableLogged = false
   /** Running-agent ids for the mutation gate; logs once when the host exposes no agents service. */
@@ -262,7 +297,24 @@ export function mountMarketRoutes(
   // disabledSkins loads transparently) plus custom groups. Every toggle,
   // group, install and uninstall mutates this shared state and persists it.
   const marketState = readMarketState(activeProfileDir)
+  setCustomGithubProxy(marketState.githubProxy ?? null)
   const disabled = marketState.disabled
+  /**
+   * Packages whose files were replaced while their host half was already
+   * running, this process only.
+   *
+   * Replacing a package on disk does not unload the module Node has already
+   * imported — measured against a real host in tests/web/update.e2e.ts, where
+   * 2.0.0 is on disk and the process keeps answering as 1.0.0. The update
+   * REPLY says so, but the installed listing recomputed activation from the
+   * loader's inventory alone, and the loader still lists the name: so the
+   * moment the page refreshed, a plugin serving its old build read as `live`
+   * and the restart notice vanished.
+   *
+   * Deliberately not persisted. What it records is a fact about THIS
+   * process, and a restart — the thing that resolves it — ends the process.
+   */
+  const replacedWhileLive = new Set<string>()
   const groups = marketState.groups
   const groupOrder = marketState.groupOrder
   // A choice made in a previous session outranks whatever the entry layer
@@ -295,6 +347,9 @@ export function mountMarketRoutes(
   // few seconds after boot.
   if (config.region === undefined) {
     void resolveRegion(undefined).then(({ region: probed }) => {
+      // A manual choice made while the probe was pending, or a replacement
+      // mount created after this one was disposed, owns the region now.
+      if (disposed || config.region !== undefined) return
       applyRegion(probed)
       regionAuto = true
       // Persisted as the decision, not re-probed each boot: a market that
@@ -339,6 +394,9 @@ export function mountMarketRoutes(
     marketState.channel = fresh.channel
     marketState.region = fresh.region
     marketState.regionAuto = fresh.regionAuto
+    marketState.favorites = fresh.favorites
+    marketState.githubProxy = fresh.githubProxy
+    setCustomGithubProxy(fresh.githubProxy ?? null)
   }
 
   // Client-only packages (dsh.client without dsh.bundle) are invisible to the
@@ -373,6 +431,17 @@ export function mountMarketRoutes(
   let mutationBusy = false
   /** The shared mutation chain: every mutating operation appends to it. */
   let mutationChain: Promise<unknown> = Promise.resolve()
+
+  /**
+   * Append a lightweight state write to the mutation chain without answering
+   * 409 when another operation is in flight. Favorites are catalog bookmarks
+   * only — they must stay editable while an install runs (#414).
+   */
+  async function withMutationQueued<T>(fn: () => Promise<T> | T): Promise<T> {
+    const run = mutationChain.then(async () => fn())
+    mutationChain = run.catch(() => undefined)
+    return await run
+  }
 
   /**
    * Run a mutating operation under the shared mutation lock. `kind` selects
@@ -439,6 +508,11 @@ export function mountMarketRoutes(
         const result = await hotMount(host, dir, name)
         ok = result.ok
         reason = result.reason ?? undefined
+        // A mount that succeeded imported the module as it is on disk NOW,
+        // so whatever was replaced under the old instance is no longer what
+        // this process is serving. Off-and-on is a real way out of the
+        // restart notice, and holding it after that would be wrong.
+        if (result.ok) replacedWhileLive.delete(name)
       }
     } else {
       ok = await hotUnmount(name) || await themes.setEntryDisabled(name, true)
@@ -816,6 +890,15 @@ export function mountMarketRoutes(
   }
 
   async function removeInstalledPackage(name: string): Promise<{ ok: boolean; hot: boolean; detail: string | null }> {
+    // Asked BEFORE the removal, while the files are still there to look at.
+    // A native addon is never released by unloading (#441): Node has no
+    // dlclose, so the process keeps the `.node` open until it exits, and on
+    // Windows the next install of the same plugin fails renaming over it.
+    // Reporting this uninstall as `hot` would be claiming it took effect
+    // without a restart, which for these is exactly what did not happen —
+    // and the page then tells the user to refresh, which is the one thing
+    // that cannot help.
+    const native = holdsNativeAddon(config.profile, name, activeProfileDir)
     const result = await runPlugin(config.profile, ['remove', name])
     if (result.exitCode !== 0 || result.timedOut || result.cancelled) {
       return { ok: false, hot: false, detail: failureDetail(result) }
@@ -825,9 +908,13 @@ export function mountMarketRoutes(
     // because the first succeeded.
     const unmounted = await hotUnmount(name)
     const entryDisabled = await themes.setEntryDisabled(name, true)
-    const hot = unmounted || entryDisabled
+    const hot = (unmounted || entryDisabled) && !native
+    if (native) {
+      logEvent('info', 'uninstall', `${name} ships or depends on a native addon; a restart is needed before it can be installed again`)
+    }
     removeRowBlocks(userPatchPath, rowIdsForPackage(host, activeProfileDir, name))
     disabled.delete(name)
+    replacedWhileLive.delete(name)
     removeFromGroups({ groups, groupOrder }, name)
     writeMarketState(activeProfileDir, { disabled, groups, groupOrder })
     return { ok: true, hot, detail: null }
@@ -1103,6 +1190,7 @@ export function mountMarketRoutes(
             supported: canRestart,
             managedBy: canRestart ? 'market' : config.profileDirectory === undefined ? 'operator' : 'desktop-host',
             supervisor: detectedSupervisor(),
+            debugger: detectedDebugger(),
           },
           operationRetention: 'current-process',
           operationLimit: MAX_UPDATE_OPERATIONS_V1,
@@ -1447,7 +1535,11 @@ export function mountMarketRoutes(
         }
         try {
           try {
-            sendJson(response, 200, { registry: await loadRegistry() })
+            const registry = await loadRegistry()
+            sendJson(response, 200, {
+              registry,
+              hostVersion: dshHostInfo()?.version ?? null,
+            })
           } catch (error) {
             // Say what went wrong. The market used to substitute a bundled
             // copy here, so an unreachable registry looked exactly like a
@@ -1456,6 +1548,51 @@ export function mountMarketRoutes(
             logEvent('warn', 'registry', `catalog fetch failed: ${message}`)
             sendJson(response, 502, { error: message })
           }
+        } catch (error) {
+          sendJson(response, 500, { error: error instanceof Error ? error.message : String(error) })
+        }
+      },
+    }),
+
+    host.webServer.register({
+      kind: 'exact',
+      path: '/dsh-market/discovery-compatibility',
+      handler: async (request, response) => {
+        if (request.method !== 'POST') {
+          response.writeHead(405, { allow: 'POST' })
+          response.end()
+          return
+        }
+        if (!sameOrigin(request)) {
+          sendJson(response, 403, { error: 'untrusted origin' })
+          return
+        }
+        let body: unknown
+        try {
+          body = await readJsonBody(request, 32 * 1024)
+        } catch (error) {
+          sendJson(response, 400, { error: error instanceof Error ? error.message : String(error) })
+          return
+        }
+        const requested = body !== null && typeof body === 'object' && !Array.isArray(body)
+          ? (body as { packages?: unknown }).packages
+          : undefined
+        if (!Array.isArray(requested) || requested.length > 64
+          || !requested.every(name => typeof name === 'string' && NPM_NAME_RE.test(name))) {
+          sendJson(response, 400, { error: 'packages must be an array of at most 64 npm package names' })
+          return
+        }
+        const packages = [...new Set(requested as string[])]
+        try {
+          const host = dshHostInfo()
+          const hostVersion = host?.version ?? null
+          const hostPackages = corePackageNames(host?.directory ?? null)
+          const facts = await discoveryManifests.lookup(packages, routesFor(region).npmRegistry)
+          const plugins = Object.fromEntries(packages.map(name => [
+            name,
+            deriveHostCompatibility(facts[name] ?? null, hostVersion, hostPackages),
+          ]))
+          sendJson(response, 200, { hostVersion, plugins })
         } catch (error) {
           sendJson(response, 500, { error: error instanceof Error ? error.message : String(error) })
         }
@@ -1492,8 +1629,11 @@ export function mountMarketRoutes(
         const activation: Record<string, ReturnType<typeof verifyActivation>> = {}
         const live = liveNames()
         for (const name of Object.keys(installed)) {
-          activation[name] = verifyActivation(config.profile, name, live, activeProfileDir,
-            disabled.has(name) || patchFlags.disabled.includes(name))
+          activation[name] = activationAfterReplace(
+            verifyActivation(config.profile, name, live, activeProfileDir,
+              disabled.has(name) || patchFlags.disabled.includes(name)),
+            replacedWhileLive.has(name),
+          )
         }
         const diagnostics = diagnosePackageManifests(Object.keys(installed).map(packageName => ({
           packageName,
@@ -1512,6 +1652,7 @@ export function mountMarketRoutes(
           groups,
           groupOrder,
           notes: readMarketState(activeProfileDir).notes ?? {},
+          favorites: readMarketState(activeProfileDir).favorites ?? [],
           patch: { disables: patch.disables, forced: patch.forced, inserts: patch.inserts },
           patchDisabled: patchFlags.disabled,
           patchForced: patchFlags.forced,
@@ -2031,6 +2172,59 @@ export function mountMarketRoutes(
 
     host.webServer.register({
       kind: 'exact',
+      path: '/dsh-market/favorite',
+      handler: async (request, response) => {
+        if (request.method !== 'POST') {
+          response.writeHead(405, { allow: 'POST' })
+          response.end()
+          return
+        }
+        if (!sameOrigin(request)) {
+          sendJson(response, 403, { error: 'untrusted origin' })
+          return
+        }
+        try {
+          await withMutationQueued(async () => {
+            const body = (await readJsonBody(request)) as { url?: unknown; favorited?: unknown } | null
+            const url = typeof body?.url === 'string' ? body.url.trim() : ''
+            if (url === '' || (!url.startsWith('http://') && !url.startsWith('https://'))) {
+              sendJson(response, 400, { error: 'url is required / 需要有效的 http(s) url' })
+              return
+            }
+            const state = readMarketState(activeProfileDir)
+            const favorites = [...(state.favorites ?? [])]
+            const favorited = body?.favorited === true
+            if (favorited) {
+              if (favorites.includes(url)) {
+                sendJson(response, 200, { ok: true, favorites })
+                return
+              }
+              if (favorites.length >= MAX_FAVORITES) {
+                sendJson(response, 400, {
+                  error: `favorites limit reached (${String(MAX_FAVORITES)}) / 收藏已达上限（${String(MAX_FAVORITES)}）`,
+                })
+                return
+              }
+              favorites.push(url)
+            } else {
+              const index = favorites.indexOf(url)
+              if (index !== -1) favorites.splice(index, 1)
+            }
+            // Re-read immediately before write so a concurrent install cannot
+            // leave us holding a stale disabled/groups snapshot (#414).
+            const fresh = readMarketState(activeProfileDir)
+            writeMarketState(activeProfileDir, { ...fresh, favorites })
+            refreshMarketState()
+            sendJson(response, 200, { ok: true, favorites })
+          })
+        } catch (error) {
+          sendJson(response, 500, { error: error instanceof Error ? error.message : String(error) })
+        }
+      },
+    }),
+
+    host.webServer.register({
+      kind: 'exact',
       path: '/dsh-market/groups',
       handler: async (request, response) => {
         if (request.method !== 'POST') {
@@ -2166,6 +2360,11 @@ export function mountMarketRoutes(
           // `region` on the client, so the routing table has one home and a
           // change to it cannot leave the two halves disagreeing.
           githubProxy: routesFor(region).githubProxy,
+          // New clients use per-service candidates. Keep githubProxy above
+          // for older bundles that understand only one prefix.
+          githubRoutes: routesFor(region).githubRoutes,
+          githubProxyCustom: marketState.githubProxy ?? null,
+          githubProxyManaged: githubProxyManaged(),
           // Whether the region was decided by the network check rather than
           // by the user — the card explains a choice it made on their behalf
           // exactly once, so nobody has to wonder why downloads moved.
@@ -2174,6 +2373,7 @@ export function mountMarketRoutes(
           // Named so the UI can say WHY the button is gone. A blank
           // "no restart button" is the state #229 reported as broken.
           supervisor: detectedSupervisor(),
+          debugger: detectedDebugger(),
           selfManaged: installed.dshmarket !== undefined || installed['dsh-market'] !== undefined,
           installed,
         })
@@ -2264,9 +2464,12 @@ export function mountMarketRoutes(
               .map(name => [name, channel] as const),
           )
           const onlineSourceFor = new Map<string, string>()
+          const sourceMigrationFor = new Map<string, { kind: 'git-to-npm'; repo: string; target: string }>()
           try {
             const registry = await loadRegistry()
             for (const [name, spec] of Object.entries(installed)) {
+              const migration = findGitToNpmMigration(registry.plugins, spec)
+              if (migration !== null) sourceMigrationFor.set(name, migration)
               if (!spec.toLowerCase().startsWith('file:')) continue
               const evidence = readInstalledRepoEvidence(config.profile, name, spec, activeProfileDir)
               const entry = findCatalogEntryForLocal(registry.plugins, name, evidence.identities, evidence.hints)
@@ -2274,11 +2477,14 @@ export function mountMarketRoutes(
               if (target !== null && NPM_NAME_RE.test(target)) onlineSourceFor.set(name, target)
             }
           } catch (error) {
-            logEvent('warn', 'updates', `local package source lookup failed — ${error instanceof Error ? error.message : String(error)}`)
+            logEvent('warn', 'updates', `package source lookup failed — ${error instanceof Error ? error.message : String(error)}`)
           }
-          sendJson(response, 200, {
-            updates: await checkUpdates(config.profile, force, activeProfileDir, channelFor, onlineSourceFor),
-          })
+          const updates = await checkUpdates(config.profile, force, activeProfileDir, channelFor, onlineSourceFor)
+          for (const [name, migration] of sourceMigrationFor) {
+            const status = updates[name]
+            if (status !== undefined) updates[name] = { ...status, sourceMigration: migration }
+          }
+sendJson(response, 200, { updates })
         } catch (error) {
           sendJson(response, 500, { error: error instanceof Error ? error.message : String(error) })
         }
@@ -2307,6 +2513,216 @@ export function mountMarketRoutes(
             return
           }
           sendJson(response, 200, await updateNotesFor(config.profile, activeProfileDir, name))
+        } catch (error) {
+          sendJson(response, 500, { error: error instanceof Error ? error.message : String(error) })
+        }
+      },
+    }),
+
+
+    host.webServer.register({
+      kind: 'exact',
+      path: '/dsh-market/migrate-source',
+      handler: async (request, response) => {
+        if (request.method !== 'POST') {
+          response.writeHead(405, { allow: 'POST' })
+          response.end()
+          return
+        }
+        if (!sameOrigin(request)) {
+          sendJson(response, 403, { error: 'untrusted origin' })
+          return
+        }
+        try {
+          await withMutationLock(response, 'install', async () => {
+            const body = (await readJsonBody(request)) as { name?: unknown }
+            const name = typeof body.name === 'string' ? body.name : ''
+            if (!NPM_NAME_RE.test(name) || INBOX_BUNDLES.has(name)) {
+              sendJson(response, 400, { error: 'plugin is not installed' })
+              return
+            }
+
+            const manifestCapture = captureUpdateManifest()
+            if (!manifestCapture.ok) {
+              sendJson(response, 500, {
+                error: `迁移前无法安全读取 profile package.json，未执行任何修改（${manifestCapture.detail}）。 / The profile package.json could not be captured safely before migration; nothing was changed (${manifestCapture.detail}).`,
+              })
+              return
+            }
+            const spec = manifestCapture.snapshot.dependencies[name]
+            if (spec === undefined) {
+              sendJson(response, 400, { error: 'plugin is not installed' })
+              return
+            }
+
+            let migration: ReturnType<typeof findGitToNpmMigration> = null
+            try {
+              const registry = await loadRegistry()
+              migration = findGitToNpmMigration(registry.plugins, spec)
+            } catch (error) {
+              logEvent('warn', 'source-migration', `${name}: catalog lookup failed — ${error instanceof Error ? error.message : String(error)}`)
+            }
+            if (migration === null) {
+              sendJson(response, 400, {
+                error: '当前 Git 来源无法唯一核验到一个 npm 包，或包含显式 branch/tag/commit/ref；未执行迁移。 / This Git source cannot be uniquely verified to one npm package, or it carries an explicit branch/tag/commit/ref; migration was not performed.',
+              })
+              return
+            }
+
+            const targetName = migration.target
+            if (targetName !== name && manifestCapture.snapshot.dependencies[targetName] !== undefined) {
+              sendJson(response, 409, {
+                error: `目标 npm 包 ${targetName} 已经作为独立依赖安装；为避免覆盖现有安装，未执行迁移。 / The target npm package ${targetName} is already installed as a separate dependency; migration was not performed to avoid overwriting it.`,
+              })
+              return
+            }
+
+            const busyAgents = runningAgentsForGuard()
+            if (busyAgents.length > 0) {
+              sendJson(response, 409, {
+                error: `有 agent 正在运行（${busyAgents.join(', ')}）。来源迁移会替换插件文件，请等它完成或取消后再迁移。 / ${busyAgents.length === 1 ? 'An agent is running' : 'Agents are running'} (${busyAgents.join(', ')}). Source migration replaces plugin files; wait for the running work to finish (or cancel it) before migrating.`,
+                agentsBusy: true,
+                runningAgents: busyAgents,
+              })
+              return
+            }
+
+            const lockfileCapture = captureProfileLockfile()
+            if (!lockfileCapture.ok) {
+              sendJson(response, 500, { error: lockfileCapture.detail })
+              return
+            }
+
+            const wasLive = verifyActivation(config.profile, name, liveNames(), activeProfileDir, disabled.has(name)).state === 'live'
+              && hasHostHalf(config.profile, name, activeProfileDir)
+            const oldRows = rowIdsForPackage(host, activeProfileDir, name)
+            const patchFlags = packagePatchFlags(host, activeProfileDir, [name], readUserPatchState(userPatchPath))
+            const wasDisabled = disabled.has(name)
+            const manifestBefore = manifestCapture.snapshot
+            const lockfileBefore = lockfileCapture.snapshot
+
+            const rollbackMigration = async (): Promise<{ ok: boolean; detail: string | null }> => {
+              restoreProfileManifest(config.profile, manifestBefore, activeProfileDir)
+              const prepared = restoreProfileLockfile(lockfileBefore)
+              if (!prepared.ok) return prepared
+              const reinstall = await runPlugin(config.profile, ['--no-frozen-lockfile', RELEASE_AGE_OVERRIDE, 'install'])
+              restoreProfileManifest(config.profile, manifestBefore, activeProfileDir)
+              const finalLock = restoreProfileLockfile(lockfileBefore)
+              if (!finalLock.ok) return finalLock
+              if (reinstall.exitCode !== 0 || reinstall.timedOut || reinstall.cancelled) {
+                return { ok: false, detail: failureDetail(reinstall) }
+              }
+              return hasLoadableEntry(activeProfileDir, name)
+                ? { ok: true, detail: null }
+                : { ok: false, detail: 'the previous Git source was restored without a loadable entry' }
+            }
+
+            const failWithRollback = async (detail: string, extra: Record<string, unknown> = {}): Promise<void> => {
+              const rollback = await rollbackMigration()
+              logEvent(
+                rollback.ok ? 'warn' : 'error',
+                'source-migration',
+                `${name}: migration failed — ${detail}; ${rollback.ok ? 'previous Git source restored' : `rollback failed: ${rollback.detail ?? 'unknown'}`}`,
+              )
+              sendJson(response, 500, {
+                ok: false,
+                error: rollback.ok
+                  ? `${detail}；已恢复原 Git 来源。 / ${detail}; the previous Git source was restored.`
+                  : `${detail}；且原 Git 来源未能验证恢复（${rollback.detail ?? 'unknown'}）。 / ${detail}; restoration of the previous Git source could not be verified (${rollback.detail ?? 'unknown'}).`,
+                rollback: rollback.ok,
+                ...extra,
+              })
+            }
+
+            const remove = await runPlugin(config.profile, ['remove', name])
+            if (remove.exitCode !== 0 || remove.timedOut || remove.cancelled) {
+              await failWithRollback(failureDetail(remove))
+              return
+            }
+
+            const add = await runPlugin(config.profile, ['add', `${targetName}@latest`])
+            if (add.exitCode !== 0 || add.timedOut || add.cancelled) {
+              await failWithRollback(failureDetail(add), {
+                ignoredBuilds: blockedBuilds(add),
+                cancelled: add.cancelled,
+              })
+              return
+            }
+
+            const after = readInstalled(config.profile, activeProfileDir)
+            if (after[targetName] === undefined || (targetName !== name && after[name] !== undefined) || !hasLoadableEntry(activeProfileDir, targetName)) {
+              await failWithRollback('npm 目标安装完成后未形成可加载且唯一的依赖。 / The npm target did not produce one loadable replacement dependency.')
+              return
+            }
+
+            const stack = readBundleStack(activeProfileDir)
+            const trial = trialValidate(activeProfileDir, stack.community)
+            if (!trial.ok) {
+              await failWithRollback(`迁移后的 profile 无法通过启动校验（${trial.errors[0]?.message ?? 'unknown'}）。 / The migrated profile failed boot validation (${trial.errors[0]?.message ?? 'unknown'}).`)
+              return
+            }
+
+            if (targetName !== name) {
+              if (wasDisabled) {
+                disabled.delete(name)
+                disabled.add(targetName)
+              } else {
+                disabled.delete(name)
+              }
+              for (const [group, members] of Object.entries(groups)) {
+                const next: string[] = []
+                for (const member of members) {
+                  const mapped = member === name ? targetName : member
+                  if (!next.includes(mapped)) next.push(mapped)
+                }
+                groups[group] = next
+              }
+              const marketNotes = marketState.notes ?? (marketState.notes = {})
+              if (marketNotes[name] !== undefined) {
+                if (marketNotes[targetName] === undefined) marketNotes[targetName] = marketNotes[name]
+                delete marketNotes[name]
+              }
+            }
+
+            let stateWarning: string | null = null
+            try {
+              writeMarketState(activeProfileDir, marketState)
+            } catch (error) {
+              stateWarning = `市场状态未能持久化：${error instanceof Error ? error.message : String(error)} / Market state could not be persisted: ${error instanceof Error ? error.message : String(error)}`
+              logEvent('warn', 'source-migration', `${name}: ${stateWarning}`)
+            }
+
+            removeRowBlocks(userPatchPath, oldRows)
+            const patchDisabled = wasDisabled || patchFlags.disabled.includes(name)
+            const patchForced = !patchDisabled && patchFlags.forced.includes(name)
+            const patchWarnings: string[] = []
+            for (const rowId of rowIdsForPackage(host, activeProfileDir, targetName)) {
+              const changed = patchDisabled
+                ? await disableRow(userPatchPath, rowId)
+                : patchForced
+                  ? await enableRow(userPatchPath, rowId)
+                  : { ok: true, reason: null }
+              if (!changed.ok && changed.reason !== null) patchWarnings.push(changed.reason)
+            }
+            if (patchDisabled) await themes.setEntryDisabled(targetName, true)
+
+            invalidateUpdates()
+            if (wasLive) replacedWhileLive.add(targetName)
+            const activation = {
+              [targetName]: activationAfterReplace(
+                verifyActivation(config.profile, targetName, liveNames(), activeProfileDir, disabled.has(targetName)),
+                wasLive,
+              ),
+            }
+            logEvent('info', 'source-migration', `${name}: ${spec} -> ${targetName}`)
+            sendJson(response, 200, {
+              ok: true,
+              from: { name, source: spec },
+              to: { name: targetName, source: 'npm' },
+              activation,
+              warnings: [stateWarning, ...patchWarnings].filter((value): value is string => value !== null && value !== ''),
+            })
+          })
         } catch (error) {
           sendJson(response, 500, { error: error instanceof Error ? error.message : String(error) })
         }
@@ -2442,6 +2858,63 @@ export function mountMarketRoutes(
             const selfChannel = SELF_NAMES.has(name) ? activeChannel() : null
             const tag = selfChannel === null ? 'latest' : DIST_TAG[selfChannel]
             let expectedNpmVersion: string | null = null
+            // Resolve the registry pin BEFORE building the add target (#496).
+            // Desktop's install boundary otherwise fetches `latest` again to
+            // rewrite `@latest` into `name@x.y.z`; when the two views drift,
+            // verification against the first fetch rolls back a correct
+            // install. Pinning the already-resolved version here makes the
+            // boundary a no-op rewrite and keeps one source of truth.
+            if (usesNpmUpdateTarget) {
+              const installedVersion = readInstalledVersion(config.profile, name, activeProfileDir)
+              const registryLatest = selfChannel === null
+                ? await fetchNpmLatest(name)
+                : await versionOnChannel(name, selfChannel, await fetchNpmLatest(name))
+              expectedNpmVersion = registryLatest
+              // Never let `@latest` walk a profile BACKWARDS (#64 by @ZeroOrigin64):
+              // a package whose latest dist-tag was left on an older release turns
+              // this update into a downgrade that also rewrites an exact pin to
+              // `@latest`. Detection already hides the button; this guards the
+              // route itself. Unreadable versions fall through and update as before.
+              //
+              // A channel-following package is exempt from the DIRECTION, not
+              // from the check. Going backwards is exactly what "put me back on
+              // stable" means, and #64 is about a downgrade nobody asked for —
+              // so here the guard only refuses when the channel already points
+              // at what is installed, and it compares against the target tag
+              // rather than `latest`, which is not the tag being installed.
+              const refuse = selfChannel === null
+                ? installedVersion !== null && registryLatest !== null && !isUpgrade(installedVersion, registryLatest)
+                : installedVersion !== null && registryLatest !== null && installedVersion === registryLatest
+              // "Already there" is not a failure (#495 by @Ztyss). The two
+              // halves of this guard are different events wearing one reply:
+              // the registry pointing at an OLDER release is a downgrade the
+              // user must see, while it pointing at exactly what is installed
+              // means the request is a no-op — usually because the page's
+              // updatable list was snapshotted before an earlier round of the
+              // same batch updated this plugin. Answering that with a 400 made
+              // a batch that did everything right report "update failed" for
+              // three plugins that were already on the version they asked for.
+              //
+              // 200 with `skipped`, so the page can drop the row and re-read
+              // the list rather than counting a failure; no restart is owed,
+              // because nothing on disk changed.
+              if (refuse && installedVersion === registryLatest) {
+                logEvent('info', 'update', `${name} already current at ${installedVersion}; nothing to do`)
+                // The listing that offered this update is provably behind the
+                // profile, so drop it rather than serve the same wrong row for
+                // the rest of the TTL.
+                invalidateUpdates()
+                sendJson(response, 200, { ok: true, skipped: 'current', name, version: installedVersion })
+                return
+              }
+              if (refuse) {
+                logEvent('info', 'update', `${name} refused: latest=${registryLatest} is not newer than installed=${installedVersion}`)
+                sendJson(response, 400, {
+                  error: `更新会降级：registry 上的最新版是 ${registryLatest}，比已装的 ${installedVersion} 还旧，已停止，插件保持不变。 / Updating would downgrade this plugin: the registry's latest (${registryLatest}) is older than the installed ${installedVersion}, so nothing was changed.`,
+                })
+                return
+              }
+            }
             // Re-accelerated from the unpinned shortcut, never from the
             // installed URL: that one names the commit already on disk, so
             // reusing it would be an update that can never move.
@@ -2458,37 +2931,8 @@ export function mountMarketRoutes(
             const target = restore
               ? (NPM_NAME_RE.test(spec) ? `${spec}@${tag}` : await acceleratedTarget(spec, region))
               : gitSpec === null
-                ? `${name}@${tag}`
+                ? (expectedNpmVersion !== null ? `${name}@${expectedNpmVersion}` : `${name}@${tag}`)
                 : await acceleratedTarget(gitSpec, region)
-            // Never let `@latest` walk a profile BACKWARDS (#64 by @ZeroOrigin64):
-            // a package whose latest dist-tag was left on an older release turns
-            // this update into a downgrade that also rewrites an exact pin to
-            // `@latest`. Detection already hides the button; this guards the
-            // route itself. Unreadable versions fall through and update as before.
-            //
-            // A channel-following package is exempt from the DIRECTION, not
-            // from the check. Going backwards is exactly what "put me back on
-            // stable" means, and #64 is about a downgrade nobody asked for —
-            // so here the guard only refuses when the channel already points
-            // at what is installed, and it compares against the target tag
-            // rather than `latest`, which is not the tag being installed.
-            if (usesNpmUpdateTarget) {
-              const installedVersion = readInstalledVersion(config.profile, name, activeProfileDir)
-              const registryLatest = selfChannel === null
-                ? await fetchNpmLatest(name)
-                : await versionOnChannel(name, selfChannel, await fetchNpmLatest(name))
-              expectedNpmVersion = registryLatest
-              const refuse = selfChannel === null
-                ? installedVersion !== null && registryLatest !== null && !isUpgrade(installedVersion, registryLatest)
-                : installedVersion !== null && registryLatest !== null && installedVersion === registryLatest
-              if (refuse) {
-                logEvent('info', 'update', `${name} refused: latest=${registryLatest} is not newer than installed=${installedVersion}`)
-                sendJson(response, 400, {
-                  error: `已是最新：registry 的 latest 是 ${registryLatest}，不高于已装的 ${installedVersion}，更新会造成降级。 / Already current: the registry's latest (${registryLatest}) is not newer than the installed ${installedVersion}, so updating would downgrade it.`,
-                })
-                return
-              }
-            }
             const repoIdentity = isGit ? repoOfTarget(spec) : null
             const repoKey = repoIdentity?.split('#')[0] ?? null
             // dsh-cli's deliberately narrow target grammar rejects the `&`
@@ -2632,7 +3076,13 @@ export function mountMarketRoutes(
             // exact prior source identity unless the host rejected the start
             // as busy or the user deliberately cancelled and chose to inspect
             // the resulting partial state.
-            if ((result.exitCode !== 0 || result.timedOut) && !cancelled && result.busy !== true) {
+            // pnpm never launched (#502): nothing was written, so there is
+            // nothing to restore — and the notice this block produces when a
+            // rollback cannot be verified ("inspect this profile before
+            // restarting") would be alarm over an untouched profile, on top
+            // of a failure the user already cannot act on from here.
+            if ((result.exitCode !== 0 || result.timedOut) && !cancelled && result.busy !== true
+              && !pnpmNeverStarted(result)) {
               const rollback = await rollbackAttemptBuild()
               rollbackOk = rollback.ok
               rollbackDetail = rollback.detail
@@ -2668,13 +3118,29 @@ export function mountMarketRoutes(
                 if (stale) ok = false
               }
             }
-            // pnpm's minimumReleaseAge can silently resolve `@latest` to an
-            // OLDER release and still exit 0. The old stale check only caught
-            // "same version"; a real 0.2.24 -> 0.2.23 regression therefore
-            // looked like a successful update. Verify the bytes that actually
-            // landed against both the pre-update version and the registry
-            // target, then rematerialize the previous build on any mismatch.
+            // Verify the bytes that landed against the pin this run asked for.
+            // When the route already sent an exact `name@x.y.z` (#496), that
+            // pin is authoritative: Desktop's install boundary must not be
+            // allowed to lower the bar by reporting a different
+            // `resolvedNpmVersion`. Only a floating dist-tag target (registry
+            // metadata unavailable, so the add still says `@latest`/`@beta`)
+            // adopts the boundary's reported pin — that is the version the
+            // host actually handed to pnpm.
+            //
+            // Getting LESS than the pin is still a mismatch (including the
+            // historical `@latest` + minimumReleaseAge silent-hold shape,
+            // when a floating tag is what was sent). A version above the pin
+            // is only possible on a floating target whose resolver moved
+            // forward mid-download; that stays accepted.
             if (ok && usesNpmUpdateTarget) {
+              const floatingDistTag = expectedNpmVersion === null
+              if (
+                floatingDistTag
+                && typeof result.resolvedNpmVersion === 'string'
+                && result.resolvedNpmVersion !== ''
+              ) {
+                expectedNpmVersion = result.resolvedNpmVersion
+              }
               const afterVersion = readInstalledVersion(config.profile, name, activeProfileDir)
               const direction = beforeVersion !== null && afterVersion !== null
                 ? compareVersions(afterVersion, beforeVersion)
@@ -2772,6 +3238,10 @@ export function mountMarketRoutes(
             } | undefined
             if (ok) {
               invalidateUpdates()
+              // Remembered, not just reported: the listing recomputes
+              // activation on every page load and would otherwise call this
+              // live again the moment the user refreshed.
+              if (wasLive) replacedWhileLive.add(name)
               activation = {
                 [name]: activationAfterReplace(
                   verifyActivation(config.profile, name, liveNames(), activeProfileDir, disabled.has(name)),
@@ -3017,6 +3487,51 @@ export function mountMarketRoutes(
       },
     }),
 
+    /**
+     * Last-resort GitHub prefix for networks where every built-in route is
+     * unavailable. It is one escape hatch, not three service-level knobs;
+     * the service ordering itself remains maintained by the routing table.
+     */
+    host.webServer.register({
+      kind: 'exact',
+      path: '/dsh-market/github-proxy',
+      handler: async (request, response) => {
+        if (request.method !== 'POST') {
+          response.writeHead(405, { allow: 'POST' })
+          response.end()
+          return
+        }
+        if (!sameOrigin(request)) {
+          sendJson(response, 403, { error: 'untrusted origin' })
+          return
+        }
+        if (githubProxyManaged()) {
+          sendJson(response, 409, { error: 'GitHub proxy is managed by DSHM_GITHUB_PROXY' })
+          return
+        }
+        try {
+          const body = (await readJsonBody(request)) as { proxy?: unknown }
+          const wanted = body.proxy === null ? null : normalizeGithubProxy(body.proxy)
+          if (body.proxy !== null && wanted === null) {
+            sendJson(response, 400, {
+              error: 'proxy must be an HTTPS prefix without credentials, query parameters, or a fragment',
+            })
+            return
+          }
+          setCustomGithubProxy(wanted)
+          marketState.githubProxy = wanted ?? undefined
+          writeMarketState(activeProfileDir, marketState)
+          invalidateUpdates()
+          logEvent('info', 'region', wanted === null
+            ? 'custom GitHub route cleared; automatic routing restored'
+            : 'custom GitHub route updated')
+          sendJson(response, 200, { ok: true, githubProxyCustom: wanted })
+        } catch (error) {
+          sendJson(response, 500, { error: error instanceof Error ? error.message : String(error) })
+        }
+      },
+    }),
+
     host.webServer.register({
       kind: 'exact',
       path: '/dsh-market/self-uninstall',
@@ -3136,6 +3651,10 @@ export function mountMarketRoutes(
         // One-click restart contributed in #14 by @ysyyhhh.
         if (!restartAllowed(config)) {
           sendJson(response, 403, { error: 'self-restart is disabled for this host' })
+          return
+        }
+        if (detectedDebugger() !== null) {
+          sendJson(response, 403, { error: 'self-restart is disabled while the host is under a debugger' })
           return
         }
         if (!trustedRestartRequest(request)) {
@@ -3382,6 +3901,15 @@ export function mountMarketRoutes(
             // runPlugin the package may be gone from node_modules, so a post-hoc
             // check would always return false on a successful uninstall.
             const hadClientPart = packageHasClientPart(activeProfileDir, name)
+            // Also captured before the removal, and for the same reason: a
+            // native addon in this plugin or one of its dependencies is not
+            // released by unloading it (#441). Node has no dlclose, so the
+            // process holds the `.node` until it exits — and on Windows the
+            // next install of the same plugin then fails renaming over the
+            // copy this process is still holding. Calling such an uninstall
+            // `hot` would send the user to a page refresh, which is the one
+            // thing that cannot help.
+            const heldNativeAddon = holdsNativeAddon(config.profile, name, activeProfileDir)
             const result = await runPlugin(config.profile, ['remove', name])
             const cancelled = result.cancelled
             const ok = result.exitCode === 0 && !result.timedOut && !cancelled
@@ -3422,6 +3950,10 @@ export function mountMarketRoutes(
               // successful unmount costs a lookup and nothing else.
               const entryDisabled = await themes.setEntryDisabled(name, true)
               hot = hot || entryDisabled
+              if (heldNativeAddon && hot) {
+                logEvent('info', 'uninstall', `${name} ships or depends on a native addon, which this process cannot release — reporting the uninstall as needing a restart`)
+              }
+              hot = hot && !heldNativeAddon
               // Patch-layer rows must not survive the remove either: a
               // `- id: X` + `disabled: true` row for a package that no longer
               // mounts is a boot-time orphan (port of dsh-plugin-hub).
@@ -3588,14 +4120,14 @@ export function mountMarketRoutes(
               sendJson(response, 400, { error: 'unsupported source url' })
               return
             }
-            // Resolve GitHub HEAD through the region's mirror, when there is
-            // one, then let pnpm fetch the canonical commit-pinned target.
+            // Resolve GitHub HEAD through the region's available routes, then
+            // let pnpm fetch the canonical commit-pinned target.
             // Applied HERE, before the guards below, so every step downstream
             // reasons about the exact spec that will be installed. Returns
             // the original on any lookup failure (see accelerate.ts).
             const target = await acceleratedTarget(plainTarget, region)
             if (target !== plainTarget) {
-              logEvent('info', 'region', `${entry.name}: resolved HEAD through the ${region} mirror; downloading the commit-pinned GitHub target directly for pnpm integrity`)
+              logEvent('info', 'region', `${entry.name}: resolved HEAD through an available ${region} route; downloading the commit-pinned GitHub target directly for pnpm integrity`)
             }
             // Duplicate guard (#27): the same plugin listed under another name
             // (an alias entry pointing at the same repo) must never install
@@ -3883,6 +4415,7 @@ export function mountMarketRoutes(
   ]
 
   return () => {
+    disposed = true
     configurePersistentLog(null)
     for (const dispose of disposers) dispose()
   }
