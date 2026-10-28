@@ -145,6 +145,33 @@ function animationValues(selector: string): string[] {
     .filter((value): value is string => value !== undefined)
 }
 
+describe('the header keeps the subtitle left on a settings-dialog width', () => {
+  it('stacks the heading above the actions before they crowd the subtitle', () => {
+    // The settings dialog is wider than 560px, so the old column break never
+    // fired: titleRow and titleActions stayed side-by-side, and the wrapped
+    // sentence sat in the leftover middle. Stacking at 800px puts the
+    // subtitle under the title, full width, left-aligned — without moving
+    // the version or the repo name.
+    const start = CSS.indexOf('@container (max-width:800px)')
+    expect(start, 'missing @container (max-width:800px)').toBeGreaterThan(-1)
+    let depth = 0
+    let end = start
+    for (let i = CSS.indexOf('{', start); i < CSS.length; i++) {
+      if (CSS[i] === '{') depth += 1
+      else if (CSS[i] === '}') {
+        depth -= 1
+        if (depth === 0) {
+          end = i
+          break
+        }
+      }
+    }
+    const block = CSS.slice(start, end)
+    expect(block).toMatch(/\.headTop\{[^}]*flex-direction:column/)
+    expect(block).toMatch(/\.headTop\{[^}]*align-items:stretch/)
+  })
+})
+
 describe('the animated mark keeps both halves on one clock', () => {
   const halves = ['logoCell', 'logoPlug'] as const
 

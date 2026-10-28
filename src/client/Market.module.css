@@ -9,7 +9,9 @@
 .head{display:flex;flex-direction:column;gap:8px;padding:0 4px 4px}
 /* One identity line: the sentence describes the section, the cluster on the
    right says which section — the host's pageHead already carries the name, so
-   repeating it as a heading was a third title for the same thing. */
+   repeating it as a heading was a third title for the same thing. The
+   settings dialog is wider than 560px but still too tight for that row: at
+   800px the heading stacks above the actions so the subtitle stays left. */
 .headTop{display:flex;align-items:center;justify-content:space-between;gap:6px 16px;flex-wrap:wrap;min-width:0}
 /* The sentence follows the name and is allowed to wrap: it is the one piece of
    prose in the header, and truncating it would say less than wrapping does. */
@@ -337,7 +339,7 @@
    with shrink left on will squeeze until the host Button stacks its icon
    above the label. */
 .exportLogBtn{flex-shrink:0;white-space:nowrap}
-@container (max-width:560px){
+@container (max-width:800px){
   .headTop{flex-direction:column;align-items:stretch}
   .headTop > .titleRow{margin-left:0}
 }
